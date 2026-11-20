@@ -1,7 +1,11 @@
 import { useState, type FormEvent } from 'react';
-import { Lock, ArrowRight, ShieldCheck, X } from 'lucide-react';
+import { Lock, ArrowRight, Check, Copy, ExternalLink, ShieldCheck, X } from 'lucide-react';
 import { createStudioSession } from '../lib/api';
-import { isFirebaseConfigured, signInWithGooglePopup } from '../lib/firebase';
+import {
+  firebaseProjectId,
+  isFirebaseConfigured,
+  signInWithGooglePopup,
+} from '../lib/firebase';
 import type { StudioUserSession } from '../types/studio';
 
 interface AuthModalProps {
@@ -15,11 +19,26 @@ export function AuthModal({ open, onClose, onAuthenticated }: AuthModalProps) {
   const [email, setEmail] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [unauthorizedHost, setUnauthorizedHost] = useState<string | null>(null);
+  const [copiedHost, setCopiedHost] = useState(false);
 
   if (!open) return null;
 
+  async function handleCopyHost() {
+    if (!unauthorizedHost || typeof navigator === 'undefined' || !navigator.clipboard) return;
+    try {
+      await navigator.clipboard.writeText(unauthorizedHost);
+      setCopiedHost(true);
+      setTimeout(() => setCopiedHost(false), 2000);
+    } catch {
+      // Clipboard API unavailable
+    }
+  }
+
   async function handleGoogleAuth() {
     setError(null);
+    setUnauthorizedHost(null);
+    setCopiedHost(false);
     setLoading(true);
     try {
       const cred = await signInWithGooglePopup();
@@ -37,8 +56,9 @@ export function AuthModal({ open, onClose, onAuthenticated }: AuthModalProps) {
       const message = err instanceof Error ? err.message : 'Google sign-in failed.';
       if (code === 'auth/unauthorized-domain' || message.includes('auth/unauthorized-domain')) {
         const host = typeof window !== 'undefined' ? window.location.hostname : 'this domain';
+        setUnauthorizedHost(host);
         setError(
-          `Domain "${host}" is not authorized in Firebase Authentication yet. Reload the page if domain provisioning just completed, or add "${host}" under Firebase Console -> Authentication -> Settings -> Authorized domains.`
+          `Domain "${host}" is not authorized in Firebase Authentication yet. Add "${host}" under Firebase Console -> Authentication -> Settings -> Authorized domains.`
         );
       } else if (code === 'auth/popup-blocked' || message.includes('auth/popup-blocked')) {
         setError(
@@ -103,17 +123,37 @@ export function AuthModal({ open, onClose, onAuthenticated }: AuthModalProps) {
         </div>
 
         {error && (
-          <div className="p-3 rounded-lg bg-rose-950/60 border border-rose-500/30 text-sm text-rose-200 space-y-2">
+          <div className="p-3 rounded-lg bg-rose-950/60 border border-rose-500/30 text-sm text-rose-200 space-y-3">
             <p>{error}</p>
-            {error.includes('Authorized domains') && (
-              <a
-                href="https://console.firebase.google.com/project/virtual-etching-ngmzr/authentication/settings"
-                target="_blank"
-                rel="noopener noreferrer"
-                className="inline-block text-xs font-medium text-violet-300 underline hover:text-violet-200"
-              >
-                Open Firebase Authorized Domains Settings
-              </a>
+            {unauthorizedHost && (
+              <div className="flex flex-wrap items-center gap-2 pt-1">
+                <button
+                  type="button"
+                  onClick={handleCopyHost}
+                  className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-md bg-white/10 hover:bg-white/15 text-xs font-medium text-white transition-colors cursor-pointer"
+                >
+                  {copiedHost ? (
+                    <>
+                      <Check className="w-3.5 h-3.5 text-emerald-400" />
+                      Copied {unauthorizedHost}
+                    </>
+                  ) : (
+                    <>
+                      <Copy className="w-3.5 h-3.5" />
+                      Copy {unauthorizedHost}
+                    </>
+                  )}
+                </button>
+                <a
+                  href={`https://console.firebase.google.com/project/${firebaseProjectId}/authentication/settings`}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-md bg-violet-600/30 hover:bg-violet-600/45 border border-violet-400/30 text-xs font-medium text-violet-200 transition-colors"
+                >
+                  <ExternalLink className="w-3.5 h-3.5" />
+                  Open Firebase Authorized Domains
+                </a>
+              </div>
             )}
           </div>
         )}

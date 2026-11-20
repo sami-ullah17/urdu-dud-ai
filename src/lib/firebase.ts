@@ -90,6 +90,7 @@ if (isFirebaseConfigured) {
 
 export const firebaseAuth = authInstance;
 export const firestoreDb = dbInstance;
+export const firebaseProjectId = firebaseConfig.projectId ?? 'virtual-etching-ngmzr';
 
 export function handleFirestoreError(
   error: unknown,
