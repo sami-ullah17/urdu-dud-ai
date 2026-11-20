@@ -33,7 +33,22 @@ export function AuthModal({ open, onClose, onAuthenticated }: AuthModalProps) {
         authMode: 'firebase',
       });
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Google sign-in failed.');
+      const code = (err as { code?: string })?.code ?? '';
+      const message = err instanceof Error ? err.message : 'Google sign-in failed.';
+      if (code === 'auth/unauthorized-domain' || message.includes('auth/unauthorized-domain')) {
+        const host = typeof window !== 'undefined' ? window.location.hostname : 'this domain';
+        setError(
+          `Domain "${host}" is not authorized in Firebase Authentication yet. Reload the page if domain provisioning just completed, or add "${host}" under Firebase Console -> Authentication -> Settings -> Authorized domains.`
+        );
+      } else if (code === 'auth/popup-blocked' || message.includes('auth/popup-blocked')) {
+        setError(
+          'Your browser blocked the Google sign-in popup. Please allow popups for this site and click Continue with Google again.'
+        );
+      } else if (code === 'auth/popup-closed-by-user') {
+        setError('Google sign-in popup was closed before completion. Please try again.');
+      } else {
+        setError(message);
+      }
     } finally {
       setLoading(false);
     }
@@ -88,8 +103,18 @@ export function AuthModal({ open, onClose, onAuthenticated }: AuthModalProps) {
         </div>
 
         {error && (
-          <div className="p-3 rounded-lg bg-rose-950/60 border border-rose-500/30 text-sm text-rose-200">
-            {error}
+          <div className="p-3 rounded-lg bg-rose-950/60 border border-rose-500/30 text-sm text-rose-200 space-y-2">
+            <p>{error}</p>
+            {error.includes('Authorized domains') && (
+              <a
+                href="https://console.firebase.google.com/project/virtual-etching-ngmzr/authentication/settings"
+                target="_blank"
+                rel="noopener noreferrer"
+                className="inline-block text-xs font-medium text-violet-300 underline hover:text-violet-200"
+              >
+                Open Firebase Authorized Domains Settings
+              </a>
+            )}
           </div>
         )}
 
