@@ -1,0 +1,277 @@
+{
+  "entities": {
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "Private user studio profile and preferences isolated per authenticated UID.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "email": {
+          "type": "string",
+          "format": "email",
+          "maxLength": 254
+        },
+        "displayName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "shortClipVerified": {
+          "type": "boolean"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["uid", "email", "displayName", "shortClipVerified", "createdAt", "updatedAt"]
+    },
+    "MovieProject": {
+      "title": "MovieProject",
+      "description": "A Turkish-to-Urdu movie dubbing project owned by a single user.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "ownerId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 180
+        },
+        "originalFilename": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 255
+        },
+        "format": {
+          "type": "string",
+          "enum": ["mp4", "mov", "mkv"]
+        },
+        "fileSizeBytes": {
+          "type": "number"
+        },
+        "durationSeconds": {
+          "type": "number"
+        },
+        "sourceLang": {
+          "type": "string",
+          "enum": ["tr"]
+        },
+        "targetLang": {
+          "type": "string",
+          "enum": ["ur-PK"]
+        },
+        "rightsConfirmed": {
+          "type": "boolean"
+        },
+        "status": {
+          "type": "string",
+          "enum": ["uploaded", "queued", "scanning", "ready_for_dubbing", "processing", "completed", "failed"]
+        },
+        "currentStage": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "stageIndex": {
+          "type": "number"
+        },
+        "progressPercent": {
+          "type": "number"
+        },
+        "totalChunks": {
+          "type": "number"
+        },
+        "completedChunks": {
+          "type": "number"
+        },
+        "failedChunks": {
+          "type": "number"
+        },
+        "demoMode": {
+          "type": "boolean"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "id",
+        "ownerId",
+        "title",
+        "originalFilename",
+        "format",
+        "fileSizeBytes",
+        "durationSeconds",
+        "sourceLang",
+        "targetLang",
+        "rightsConfirmed",
+        "status",
+        "currentStage",
+        "stageIndex",
+        "progressPercent",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "CharacterProfile": {
+      "title": "CharacterProfile",
+      "description": "Speaker character identity and locked Pakistani Urdu voice profile for a movie.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "movieId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "ownerId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "speakerLabel": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "characterName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100
+        },
+        "gender": {
+          "type": "string",
+          "enum": ["male", "female", "unknown"]
+        },
+        "genderConfidence": {
+          "type": "number"
+        },
+        "voiceProfileId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "lineCount": {
+          "type": "number"
+        },
+        "sampleTurkish": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "sampleUrdu": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "id",
+        "movieId",
+        "ownerId",
+        "speakerLabel",
+        "characterName",
+        "gender",
+        "genderConfidence",
+        "voiceProfileId",
+        "lineCount",
+        "updatedAt"
+      ]
+    },
+    "ProcessingLog": {
+      "title": "ProcessingLog",
+      "description": "Immutable chronological processing stage log entry for a dubbing job.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "movieId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "ownerId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "stage": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100
+        },
+        "level": {
+          "type": "string",
+          "enum": ["info", "warn", "error", "success"]
+        },
+        "message": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 500
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["id", "movieId", "ownerId", "stage", "level", "message", "createdAt"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/UserProfile" },
+      "description": "Private user studio profiles keyed by Firebase Auth UID."
+    },
+    "/movies/{movieId}": {
+      "schema": { "$ref": "#/entities/MovieProject" },
+      "description": "Movie dubbing projects owned by authenticated users."
+    },
+    "/movies/{movieId}/characters/{characterId}": {
+      "schema": { "$ref": "#/entities/CharacterProfile" },
+      "description": "Identified speaker characters and locked Pakistani Urdu voice assignments."
+    },
+    "/movies/{movieId}/logs/{logId}": {
+      "schema": { "$ref": "#/entities/ProcessingLog" },
+      "description": "Persistent pipeline stage logs for each movie dubbing job."
+    }
+  }
+}

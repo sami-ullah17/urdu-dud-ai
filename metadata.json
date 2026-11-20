@@ -1,0 +1,8 @@
+{
+  "name": "UrduDub AI",
+  "description": "AI-powered Turkish to Pakistani Urdu movie dubbing platform supporting films up to 180 minutes with consistent character voices, SFX preservation, and MP4/SRT export.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

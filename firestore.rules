@@ -1,0 +1,214 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Global default-deny safety net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerifiedUser() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isValidUserProfile(data) {
+      return data.keys().hasAll(['uid', 'email', 'displayName', 'shortClipVerified', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['uid', 'email', 'displayName', 'shortClipVerified', 'createdAt', 'updatedAt'])
+        && isValidId(data.uid)
+        && data.uid == request.auth.uid
+        && data.email is string && data.email.size() >= 3 && data.email.size() <= 254
+        && data.displayName is string && data.displayName.size() >= 1 && data.displayName.size() <= 120
+        && data.shortClipVerified is bool
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidMovieProject(data) {
+      return data.keys().hasAll([
+        'id', 'ownerId', 'title', 'originalFilename', 'format',
+        'fileSizeBytes', 'durationSeconds', 'sourceLang', 'targetLang',
+        'rightsConfirmed', 'status', 'currentStage', 'stageIndex',
+        'progressPercent', 'createdAt', 'updatedAt'
+      ])
+      && data.keys().hasOnly([
+        'id', 'ownerId', 'title', 'originalFilename', 'format',
+        'fileSizeBytes', 'durationSeconds', 'sourceLang', 'targetLang',
+        'rightsConfirmed', 'status', 'currentStage', 'stageIndex',
+        'progressPercent', 'totalChunks', 'completedChunks', 'failedChunks',
+        'demoMode', 'createdAt', 'updatedAt'
+      ])
+      && isValidId(data.id)
+      && isValidId(data.ownerId)
+      && data.ownerId == request.auth.uid
+      && data.title is string && data.title.size() >= 1 && data.title.size() <= 180
+      && data.originalFilename is string && data.originalFilename.size() >= 1 && data.originalFilename.size() <= 255
+      && data.format in ['mp4', 'mov', 'mkv']
+      && data.fileSizeBytes is number && data.fileSizeBytes > 0
+      && data.durationSeconds is number && data.durationSeconds > 0 && data.durationSeconds <= 10800
+      && data.sourceLang == 'tr'
+      && data.targetLang == 'ur-PK'
+      && data.rightsConfirmed == true
+      && data.status in ['uploaded', 'queued', 'scanning', 'ready_for_dubbing', 'processing', 'completed', 'failed']
+      && data.currentStage is string && data.currentStage.size() <= 120
+      && data.stageIndex is number && data.stageIndex >= 0 && data.stageIndex <= 10
+      && data.progressPercent is number && data.progressPercent >= 0 && data.progressPercent <= 100
+      && (!('totalChunks' in data) || (data.totalChunks is number && data.totalChunks >= 0 && data.totalChunks <= 500))
+      && (!('completedChunks' in data) || (data.completedChunks is number && data.completedChunks >= 0 && data.completedChunks <= 500))
+      && (!('failedChunks' in data) || (data.failedChunks is number && data.failedChunks >= 0 && data.failedChunks <= 500))
+      && (!('demoMode' in data) || data.demoMode is bool)
+      && data.createdAt is timestamp
+      && data.updatedAt is timestamp;
+    }
+
+    function isValidCharacterProfile(data, movieId) {
+      return data.keys().hasAll([
+        'id', 'movieId', 'ownerId', 'speakerLabel', 'characterName',
+        'gender', 'genderConfidence', 'voiceProfileId', 'lineCount', 'updatedAt'
+      ])
+      && data.keys().hasOnly([
+        'id', 'movieId', 'ownerId', 'speakerLabel', 'characterName',
+        'gender', 'genderConfidence', 'voiceProfileId', 'lineCount',
+        'sampleTurkish', 'sampleUrdu', 'updatedAt'
+      ])
+      && isValidId(data.id)
+      && isValidId(data.movieId)
+      && data.movieId == movieId
+      && isValidId(data.ownerId)
+      && data.ownerId == request.auth.uid
+      && data.speakerLabel is string && data.speakerLabel.size() >= 1 && data.speakerLabel.size() <= 64
+      && data.characterName is string && data.characterName.size() >= 1 && data.characterName.size() <= 100
+      && data.gender in ['male', 'female', 'unknown']
+      && data.genderConfidence is number && data.genderConfidence >= 0 && data.genderConfidence <= 1
+      && data.voiceProfileId is string && data.voiceProfileId.size() >= 1 && data.voiceProfileId.size() <= 64
+      && data.lineCount is number && data.lineCount >= 0
+      && (!('sampleTurkish' in data) || (data.sampleTurkish is string && data.sampleTurkish.size() <= 500))
+      && (!('sampleUrdu' in data) || (data.sampleUrdu is string && data.sampleUrdu.size() <= 500))
+      && data.updatedAt is timestamp;
+    }
+
+    function isValidProcessingLog(data, movieId) {
+      return data.keys().hasAll(['id', 'movieId', 'ownerId', 'stage', 'level', 'message', 'createdAt'])
+        && data.keys().hasOnly(['id', 'movieId', 'ownerId', 'stage', 'level', 'message', 'createdAt'])
+        && isValidId(data.id)
+        && isValidId(data.movieId)
+        && data.movieId == movieId
+        && isValidId(data.ownerId)
+        && data.ownerId == request.auth.uid
+        && data.stage is string && data.stage.size() >= 1 && data.stage.size() <= 100
+        && data.level in ['info', 'warn', 'error', 'success']
+        && data.message is string && data.message.size() >= 1 && data.message.size() <= 500
+        && data.createdAt is timestamp;
+    }
+
+    function isMovieOwner(movieId) {
+      return isSignedIn()
+        && get(/databases/$(database)/documents/movies/$(movieId)).data.ownerId == request.auth.uid;
+    }
+
+    // Users collection: strict owner-only PII isolation
+    match /users/{userId} {
+      allow get: if isSignedIn() && isValidId(userId) && request.auth.uid == userId;
+      allow list: if false;
+      allow create: if isVerifiedUser()
+        && isValidId(userId)
+        && request.auth.uid == userId
+        && isValidUserProfile(incoming())
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isVerifiedUser()
+        && isValidId(userId)
+        && request.auth.uid == userId
+        && isValidUserProfile(incoming())
+        && incoming().uid == existing().uid
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'shortClipVerified', 'updatedAt']);
+      allow delete: if false;
+    }
+
+    // Movies collection: strict owner-only access and terminal-state protection
+    match /movies/{movieId} {
+      allow get: if isSignedIn() && isValidId(movieId) && existing().ownerId == request.auth.uid;
+      allow list: if isSignedIn() && resource.data.ownerId == request.auth.uid;
+      allow create: if isVerifiedUser()
+        && isValidId(movieId)
+        && isValidMovieProject(incoming())
+        && incoming().id == movieId
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isVerifiedUser()
+        && isValidId(movieId)
+        && existing().ownerId == request.auth.uid
+        && existing().status != 'completed'
+        && isValidMovieProject(incoming())
+        && incoming().id == existing().id
+        && incoming().ownerId == existing().ownerId
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly([
+          'title', 'status', 'currentStage', 'stageIndex', 'progressPercent',
+          'totalChunks', 'completedChunks', 'failedChunks', 'demoMode', 'updatedAt'
+        ]);
+      allow delete: if isVerifiedUser() && isValidId(movieId) && existing().ownerId == request.auth.uid;
+
+      // Characters subcollection: Master Gate checks parent movie ownership
+      match /characters/{characterId} {
+        allow get: if isSignedIn() && isValidId(movieId) && isValidId(characterId) && isMovieOwner(movieId);
+        allow list: if isSignedIn() && isValidId(movieId) && resource.data.ownerId == request.auth.uid;
+        allow create: if isVerifiedUser()
+          && isValidId(movieId)
+          && isValidId(characterId)
+          && isValidCharacterProfile(incoming(), movieId)
+          && incoming().id == characterId
+          && incoming().updatedAt == request.time
+          && isMovieOwner(movieId);
+        allow update: if isVerifiedUser()
+          && isValidId(movieId)
+          && isValidId(characterId)
+          && existing().ownerId == request.auth.uid
+          && isValidCharacterProfile(incoming(), movieId)
+          && incoming().id == existing().id
+          && incoming().movieId == existing().movieId
+          && incoming().ownerId == existing().ownerId
+          && incoming().updatedAt == request.time
+          && incoming().diff(existing()).affectedKeys().hasOnly([
+            'characterName', 'gender', 'genderConfidence', 'voiceProfileId',
+            'lineCount', 'sampleTurkish', 'sampleUrdu', 'updatedAt'
+          ])
+          && isMovieOwner(movieId);
+        allow delete: if isVerifiedUser() && isValidId(movieId) && isValidId(characterId) && isMovieOwner(movieId);
+      }
+
+      // Logs subcollection: append-only per movie owner
+      match /logs/{logId} {
+        allow get: if isSignedIn() && isValidId(movieId) && isValidId(logId) && isMovieOwner(movieId);
+        allow list: if isSignedIn() && isValidId(movieId) && resource.data.ownerId == request.auth.uid;
+        allow create: if isVerifiedUser()
+          && isValidId(movieId)
+          && isValidId(logId)
+          && isValidProcessingLog(incoming(), movieId)
+          && incoming().id == logId
+          && incoming().createdAt == request.time
+          && isMovieOwner(movieId);
+        allow update: if false;
+        allow delete: if isVerifiedUser() && isValidId(movieId) && isValidId(logId) && isMovieOwner(movieId);
+      }
+    }
+  }
+}
