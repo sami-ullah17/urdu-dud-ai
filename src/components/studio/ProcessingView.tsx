@@ -7,11 +7,11 @@ import {
   Download,
   Loader2,
   Mic2,
+  PauseCircle,
   Play,
   RotateCcw,
-  Square,
 } from 'lucide-react';
-import { cancelDubbingJob, startDubbingJob } from '../../lib/api';
+import { cancelDubbingJob, resumeDubbingJob, startDubbingJob } from '../../lib/api';
 import { PROCESSING_STAGES, type MovieProject, type ProviderHealth } from '../../types/studio';
 
 interface ProcessingViewProps {
@@ -28,6 +28,20 @@ function formatDuration(sec: number | null | undefined): string {
   const rem = Math.round(sec % 60);
   if (mins === 0) return `${rem}s remaining`;
   return `${mins}m ${rem}s remaining`;
+}
+
+function formatResetTime(iso: string | undefined): string | null {
+  if (!iso) return null;
+  try {
+    return new Date(iso).toLocaleString([], {
+      month: 'short',
+      day: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit',
+    });
+  } catch {
+    return iso;
+  }
 }
 
 export function ProcessingView({
@@ -71,7 +85,21 @@ export function ProcessingView({
     }
   }
 
-  async function handleCancelJob() {
+  async function handleResumeProcessing() {
+    if (!movie) return;
+    setError(null);
+    setBusy(true);
+    try {
+      const updated = await resumeDubbingJob(movie.id);
+      onMovieUpdated(updated);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Unable to resume processing job.');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handlePauseJob() {
     if (!movie) return;
     setError(null);
     setBusy(true);
@@ -79,7 +107,7 @@ export function ProcessingView({
       const updated = await cancelDubbingJob(movie.id);
       onMovieUpdated(updated);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Unable to cancel job.');
+      setError(err instanceof Error ? err.message : 'Unable to pause job.');
     } finally {
       setBusy(false);
     }
@@ -87,10 +115,28 @@ export function ProcessingView({
 
   const isActive =
     movie.status === 'processing' || movie.status === 'queued' || movie.status === 'scanning';
+  const isPaused = movie.status === 'paused';
+  const isQuotaPaused = isPaused && movie.pauseReason === 'quota_exhausted';
+
   const pendingCount = movie.chunkStates.filter((c) => c.status === 'pending').length;
   const processingCount = movie.chunkStates.filter((c) => c.status === 'processing').length;
   const completedCount = movie.chunkStates.filter((c) => c.status === 'completed').length;
   const failedCount = movie.chunkStates.filter((c) => c.status === 'failed').length;
+  const remainingSpeechChunks = Math.max(0, movie.chunkStates.length - completedCount);
+
+  const totalTtsChunks = movie.totalTtsChunks ?? movie.segmentsCount ?? 0;
+  const completedTtsChunks = movie.completedTtsChunks ?? 0;
+  const remainingTtsChunks =
+    movie.remainingTtsChunks ?? Math.max(0, totalTtsChunks - completedTtsChunks);
+
+  const hasIncompleteWork =
+    remainingSpeechChunks > 0 || remainingTtsChunks > 0 || failedCount > 0;
+  const showResumeButton =
+    !isActive &&
+    (isPaused || movie.status === 'failed' || (movie.status !== 'completed' && hasIncompleteWork && movie.chunkStates.length > 0));
+
+  const resetTimeLabel = formatResetTime(movie.quotaResetAt ?? health?.quota?.nextResetIso);
+  const ttsUsageModels = (health?.quota?.models ?? []).filter((m) => m.model.includes('tts'));
 
   return (
     <div className="space-y-8">
@@ -172,23 +218,27 @@ export function ProcessingView({
             <button
               type="button"
               disabled={busy}
-              onClick={handleCancelJob}
-              className="inline-flex items-center gap-2 px-4 py-2 rounded-lg border border-rose-500/35 bg-rose-950/30 hover:bg-rose-900/40 text-rose-200 text-xs font-medium transition-colors whitespace-nowrap cursor-pointer disabled:opacity-50"
+              onClick={handlePauseJob}
+              className="inline-flex items-center gap-2 px-4 py-2 rounded-lg border border-amber-500/35 bg-amber-950/30 hover:bg-amber-900/40 text-amber-200 text-xs font-medium transition-colors whitespace-nowrap cursor-pointer disabled:opacity-50"
             >
-              <Square className="w-3.5 h-3.5" />
-              Cancel Job
+              <PauseCircle className="w-3.5 h-3.5" />
+              Pause Processing
             </button>
           )}
 
-          {(movie.status === 'failed' || (!isActive && failedCount > 0)) && (
+          {showResumeButton && (
             <button
               type="button"
               disabled={busy}
-              onClick={() => triggerJob('resume_chunks', movie.demoMode)}
-              className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-violet-600 hover:bg-violet-500 text-white text-xs font-medium transition-colors whitespace-nowrap cursor-pointer disabled:opacity-50"
+              onClick={handleResumeProcessing}
+              className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-gradient-to-r from-violet-600 to-indigo-600 hover:from-violet-500 hover:to-indigo-500 text-white text-xs font-medium transition-all whitespace-nowrap cursor-pointer disabled:opacity-50"
             >
-              <RotateCcw className="w-3.5 h-3.5" />
-              Retry Failed Chunks
+              {busy ? (
+                <Loader2 className="w-3.5 h-3.5 animate-spin" />
+              ) : (
+                <RotateCcw className="w-3.5 h-3.5" />
+              )}
+              Resume Processing
             </button>
           )}
 
@@ -208,9 +258,34 @@ export function ProcessingView({
       {isActive && (
         <div className="p-3.5 rounded-xl bg-indigo-950/35 border border-indigo-500/25 text-xs text-slate-200 flex items-center justify-between gap-3">
           <span>
-            Background processing active on the server. Completed chunks are saved continuously—you
-            can safely refresh or close this browser tab and return anytime.
+            Background processing active on the server. Completed speech and Urdu audio chunks are
+            saved continuously—you can safely refresh or close this browser tab and return anytime.
           </span>
+        </div>
+      )}
+
+      {isPaused && (
+        <div className="p-4 rounded-xl bg-amber-950/40 border border-amber-500/30 flex items-start gap-3 text-xs text-amber-100 leading-relaxed">
+          <PauseCircle className="w-5 h-5 text-amber-400 shrink-0 mt-0.5" />
+          <div className="space-y-1.5">
+            <p className="text-sm font-medium text-amber-200">
+              {isQuotaPaused
+                ? 'Paused Automatically — Gemini Free Tier Quota Reached'
+                : 'Processing Paused — Progress Saved'}
+            </p>
+            <p className="text-amber-100/90">
+              {completedCount} / {movie.totalChunks || movie.chunkStates.length} Turkish speech chunks and{' '}
+              {completedTtsChunks} / {totalTtsChunks} Urdu voice chunks are safely persisted ({remainingTtsChunks}{' '}
+              Urdu audio chunks remaining). Completed chunks will not be regenerated.
+            </p>
+            {isQuotaPaused && (
+              <p className="text-amber-200/80">
+                {resetTimeLabel ? `Estimated quota reset: ${resetTimeLabel}. ` : ''}
+                You can resume tomorrow without re-uploading the movie. Exact completion duration
+                depends on Google&apos;s active Free Tier API limits, which may change at any time.
+              </p>
+            )}
+          </div>
         </div>
       )}
 
@@ -222,7 +297,7 @@ export function ProcessingView({
         </div>
       )}
 
-      {(error || movie.error) && (
+      {(error || (movie.error && !isPaused)) && (
         <div className="p-4 rounded-xl bg-rose-950/50 border border-rose-500/30 flex items-start gap-3 text-sm text-rose-200">
           <AlertTriangle className="w-5 h-5 text-rose-400 shrink-0 mt-0.5" />
           <div className="space-y-1">
@@ -239,16 +314,28 @@ export function ProcessingView({
             <span className="text-xs text-slate-400">Current Stage</span>
             <p className="text-lg font-medium text-white flex items-center gap-2">
               {isActive && <Loader2 className="w-4 h-4 text-violet-400 animate-spin" />}
+              {isPaused && <PauseCircle className="w-4 h-4 text-amber-400" />}
               <span>{movie.currentStage}</span>
             </p>
           </div>
 
-          <div className="flex items-center gap-6 text-right tabular-nums">
+          <div className="flex flex-wrap items-center gap-6 text-right tabular-nums">
             <div>
-              <span className="block text-xs text-slate-400">Chunks</span>
+              <span className="block text-xs text-slate-400">Speech Chunks</span>
               <span className="text-sm font-mono text-white">
                 {movie.completedChunks} / {movie.totalChunks || 1}
               </span>
+            </div>
+            <div>
+              <span className="block text-xs text-slate-400">Urdu Audio Chunks</span>
+              <span className="text-sm font-mono text-white">
+                {completedTtsChunks} / {totalTtsChunks}
+              </span>
+              {totalTtsChunks > 0 && (
+                <span className="block text-[11px] text-slate-400">
+                  {remainingTtsChunks} remaining
+                </span>
+              )}
             </div>
             <div>
               <span className="block text-xs text-slate-400">Estimated Remaining</span>
@@ -256,9 +343,11 @@ export function ProcessingView({
                 <Clock className="w-3.5 h-3.5 text-slate-400" />
                 {movie.status === 'completed'
                   ? 'Completed'
-                  : isActive
-                    ? formatDuration(movie.etaSeconds)
-                    : '—'}
+                  : isPaused
+                    ? 'Paused'
+                    : isActive
+                      ? formatDuration(movie.etaSeconds)
+                      : '—'}
               </span>
             </div>
             <div>
@@ -276,6 +365,30 @@ export function ProcessingView({
             style={{ width: `${movie.progressPercent}%` }}
           />
         </div>
+
+        {health?.quota && (
+          <div className="pt-2 border-t border-white/10 flex flex-wrap items-center justify-between gap-2 text-xs text-slate-400">
+            <span>
+              Gemini Free Tier Queue (PT Date: <span className="font-mono text-slate-200">{health.quota.ptDate}</span>)
+            </span>
+            <div className="flex flex-wrap items-center gap-3 font-mono tabular-nums">
+              {ttsUsageModels.length > 0 ? (
+                ttsUsageModels.map((m) => (
+                  <span
+                    key={m.model}
+                    className={m.exhaustedToday ? 'text-amber-300' : 'text-slate-300'}
+                  >
+                    {m.model}: {m.requestCount}
+                    {m.configuredOrObservedLimit ? `/${m.configuredOrObservedLimit}` : ' reqs'}
+                    {m.exhaustedToday ? ' (exhausted today)' : ''}
+                  </span>
+                ))
+              ) : (
+                <span>Sequential queue active — respects daily &amp; per-minute limits</span>
+              )}
+            </div>
+          </div>
+        )}
       </div>
 
       {/* 10-Stage Pipeline Stepper + Persistent Chunk Grid */}

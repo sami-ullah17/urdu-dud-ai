@@ -15,7 +15,218 @@
       "createdAt": "2026-11-21T12:36:17.440Z"
     }
   },
-  "movies": {},
+  "movies": {
+    "mov_bc4e27c4bcce44b6": {
+      "id": "mov_bc4e27c4bcce44b6",
+      "ownerId": "studio_d2ecf1a8c00af9bc",
+      "title": "QA Resume Verification Clip",
+      "originalFilename": "qa_short_clip.mp4",
+      "format": "mp4",
+      "fileSizeBytes": 84446,
+      "durationSeconds": 8,
+      "width": 640,
+      "height": 360,
+      "sourceLang": "tr",
+      "targetLang": "ur-PK",
+      "rightsConfirmed": true,
+      "status": "completed",
+      "currentStage": "Rendering final MP4",
+      "stageIndex": 9,
+      "progressPercent": 100,
+      "etaSeconds": 0,
+      "totalChunks": 1,
+      "completedChunks": 1,
+      "failedChunks": 0,
+      "chunkStates": [
+        {
+          "index": 0,
+          "startSec": 0,
+          "endSec": 8,
+          "status": "completed",
+          "attempts": 1,
+          "durationMs": 10690
+        }
+      ],
+      "characters": [
+        {
+          "id": "char_0e582c93",
+          "movieId": "mov_bc4e27c4bcce44b6",
+          "ownerId": "studio_d2ecf1a8c00af9bc",
+          "speakerLabel": "Speaker 1",
+          "characterName": "Speaker 1",
+          "gender": "male",
+          "genderConfidence": 0.95,
+          "voiceProfileId": "urdu_male_a",
+          "lineCount": 3,
+          "sampleTurkish": "Bu dünyada hiçbir şey göründüğü gibi değil.",
+          "sampleUrdu": "اس دنیا میں کوئی بھی چیز ویسی نہیں ہے جیسی نظر آتی ہے۔",
+          "updatedAt": "2026-11-26T06:57:03.322Z"
+        },
+        {
+          "id": "char_753518ee",
+          "movieId": "mov_bc4e27c4bcce44b6",
+          "ownerId": "studio_d2ecf1a8c00af9bc",
+          "speakerLabel": "Speaker 2",
+          "characterName": "Speaker 2",
+          "gender": "female",
+          "genderConfidence": 0.92,
+          "voiceProfileId": "urdu_female_a",
+          "lineCount": 1,
+          "sampleTurkish": "Gerçek dublaj için Gemini API anahtarının tanımlı olması gerekir.",
+          "sampleUrdu": "حقیقی ڈبنگ کے لیے سرور پر جیمینائی اے آئی کی کا فعال ہونا ضروری ہے۔",
+          "updatedAt": "2026-11-26T06:57:03.322Z"
+        }
+      ],
+      "segments": [
+        {
+          "id": "demo-seg-1",
+          "chunkIndex": 0,
+          "startSec": 0.4,
+          "endSec": 2.37,
+          "speakerId": "speaker_1",
+          "speakerLabel": "Speaker 1",
+          "gender": "male",
+          "genderConfidence": 0.94,
+          "turkishText": "Demo Modu: Bu sahne yalnızca sistem önizlemesi içindir.",
+          "urduText": "ڈیمو موڈ: یہ منظر صرف سسٹم کے پیش نظارہ کے لیے ہے۔",
+          "emotion": "calm",
+          "voiceProfileId": "urdu_male_a",
+          "ttsStatus": "completed"
+        },
+        {
+          "id": "demo-seg-2",
+          "chunkIndex": 0,
+          "startSec": 2.87,
+          "endSec": 5.03,
+          "speakerId": "speaker_2",
+          "speakerLabel": "Speaker 2",
+          "gender": "female",
+          "genderConfidence": 0.92,
+          "turkishText": "Gerçek dublaj için Gemini API anahtarının tanımlı olması gerekir.",
+          "urduText": "حقیقی ڈبنگ کے لیے سرور پر جیمینائی اے آئی کی کا فعال ہونا ضروری ہے۔",
+          "emotion": "informative",
+          "voiceProfileId": "urdu_female_a",
+          "ttsStatus": "completed"
+        },
+        {
+          "id": "demo-seg-3",
+          "chunkIndex": 0,
+          "startSec": 5.53,
+          "endSec": 7.6,
+          "speakerId": "speaker_1",
+          "speakerLabel": "Speaker 1",
+          "gender": "male",
+          "genderConfidence": 0.94,
+          "turkishText": "Karakter sesleri film boyunca aynı kalır.",
+          "urduText": "ہر کردار کی آواز پوری فلم میں ایک جیسی برقرار رہتی ہے۔",
+          "emotion": "confident",
+          "voiceProfileId": "urdu_male_a",
+          "ttsStatus": "completed"
+        }
+      ],
+      "logs": [
+        {
+          "id": "ceb22a39-928b-4879-b96f-9eef037ebeac",
+          "stage": "Uploading movie",
+          "level": "success",
+          "message": "Uploaded qa_short_clip.mp4 (0.08 MB, 0.13 min).",
+          "createdAt": "2026-11-26T06:56:10.447Z"
+        },
+        {
+          "id": "4e6d4e45-4581-4db6-bb13-435e072d08ae",
+          "stage": "System",
+          "level": "info",
+          "message": "Job queued in background (mode=resume_chunks). Safe to close or refresh browser.",
+          "createdAt": "2026-11-26T06:56:10.455Z"
+        },
+        {
+          "id": "f80fc74e-1f65-4e19-866d-893a019d9c6a",
+          "stage": "Extracting audio",
+          "level": "info",
+          "message": "Extracting 48kHz stereo audio track via FFmpeg.",
+          "createdAt": "2026-11-26T06:56:10.561Z"
+        },
+        {
+          "id": "0539980e-38f5-44b3-ba94-6134ec67351f",
+          "stage": "Detecting Turkish speech",
+          "level": "info",
+          "message": "Split 8.0s audio into 1 overlapping segment(s) (120s window, 10s overlap).",
+          "createdAt": "2026-11-26T06:56:10.839Z"
+        },
+        {
+          "id": "f51f33d9-6f1a-4d2f-87b3-4378acac2181",
+          "stage": "Translating Turkish into Urdu",
+          "level": "info",
+          "message": "Speech chunk 1/1 completed (1 dialogue lines, 10.7s).",
+          "createdAt": "2026-11-26T06:56:21.530Z"
+        },
+        {
+          "id": "5c3790b6-39bc-45bd-837c-3dbea19f5f76",
+          "stage": "Generating Urdu voices",
+          "level": "info",
+          "message": "Urdu TTS queue: 0/1 audio chunk(s) already completed; 1 pending.",
+          "createdAt": "2026-11-26T06:56:21.532Z"
+        },
+        {
+          "id": "432aa5ce-fa53-4c1a-b252-00087c3d1532",
+          "stage": "System",
+          "level": "warn",
+          "message": "Paused automatically: Gemini API daily quota reached (gemini-3.8-flash-lite-tts / gemini-3.8-flash-tts). 1/1 speech chunks and 0/1 Urdu audio chunks are safely saved. Click \"Resume Processing\" after quota resets (typically the next day) without re-uploading. Completion timing depends on Google's active Free Tier quotas, which may change.",
+          "createdAt": "2026-11-26T06:56:21.536Z"
+        },
+        {
+          "id": "a1d043fa-a538-41c0-a14e-15da3eaa59c7",
+          "stage": "System",
+          "level": "info",
+          "message": "Job queued in background (mode=resume_chunks, DEMO_MODE). Safe to close or refresh browser.",
+          "createdAt": "2026-11-26T06:57:03.207Z"
+        },
+        {
+          "id": "5bf61e99-f768-46c0-80b7-0aba31a9093f",
+          "stage": "Extracting audio",
+          "level": "info",
+          "message": "Reusing previously extracted 48kHz stereo audio track from disk.",
+          "createdAt": "2026-11-26T06:57:03.320Z"
+        },
+        {
+          "id": "e2a35493-7874-4504-b89b-d6034341c958",
+          "stage": "Detecting Turkish speech",
+          "level": "info",
+          "message": "Resuming persisted schedule: 1/1 speech chunk(s) already completed and preserved.",
+          "createdAt": "2026-11-26T06:57:03.321Z"
+        },
+        {
+          "id": "9e35bbfc-389e-4e78-a496-97c0cfd03e3c",
+          "stage": "Transcribing dialogue",
+          "level": "warn",
+          "message": "DEMO MODE ACTIVE: Using clearly labeled sample dialogue transcript (no real Turkish ASR performed).",
+          "createdAt": "2026-11-26T06:57:03.322Z"
+        },
+        {
+          "id": "b3a6d410-30e1-40d2-8105-d2974a2a9c4e",
+          "stage": "Rendering final MP4",
+          "level": "success",
+          "message": "Demo Mode preview MP4 and SRT exported.",
+          "createdAt": "2026-11-26T06:57:04.120Z"
+        }
+      ],
+      "sourceVideoPath": "/app/applet/uploads/mov_bc4e27c4bcce44b6.mp4",
+      "demoMode": true,
+      "createdAt": "2026-11-26T06:56:10.447Z",
+      "updatedAt": "2026-11-26T06:57:04.120Z",
+      "targetMode": "full",
+      "processingStartedAt": "2026-11-26T06:56:10.455Z",
+      "totalTtsChunks": 3,
+      "completedTtsChunks": 3,
+      "failedTtsChunks": 0,
+      "remainingTtsChunks": 0,
+      "outputMp4Path": "/app/applet/outputs/mov_bc4e27c4bcce44b6_demo_dubbed.mp4",
+      "outputMp4SizeBytes": 99817,
+      "outputSrtPath": "/app/applet/outputs/mov_bc4e27c4bcce44b6_demo_urdu.srt",
+      "sourceSeparationMethod": "Demo Mode — FFmpeg background stem preview",
+      "processingCompletedAt": "2026-11-26T06:57:04.120Z"
+    }
+  },
   "uploadSessions": {
     "upl_84c99ce026114114ad8356b5de4f58e0": {
       "uploadId": "upl_84c99ce026114114ad8356b5de4f58e0",
@@ -29,5 +240,55 @@
       "tempFilePath": "/app/applet/uploads/tmp/upl_84c99ce026114114ad8356b5de4f58e0.part",
       "createdAt": "2026-11-21T12:36:17.456Z"
     }
+  },
+  "quotaState": {
+    "models": {
+      "gemini-3.8-flash-lite-tts": {
+        "model": "gemini-3.8-flash-lite-tts",
+        "datePt": "2026-11-25",
+        "requestCount": 2,
+        "minIntervalMs": 4500,
+        "lastRequestAtMs": 1795676139206,
+        "exhaustedUntilIso": "2026-11-26T08:00:00.000Z",
+        "lastError": "{\"error\":{\"code\":429,\"message\":\"You exceeded your current quota, please check your plan and billing details. For more information on this error, head to: https://aistudio.google.com/docs/rate-limits. To monitor your current usage, head to: https://ai.dev/rate-limit. \\n* Quota exceeded for metric: ge",
+        "observedDailyLimit": 10
+      },
+      "gemini-3.8-flash-tts": {
+        "model": "gemini-3.8-flash-tts",
+        "datePt": "2026-11-25",
+        "requestCount": 1,
+        "minIntervalMs": 4500,
+        "lastRequestAtMs": 1795676062139,
+        "exhaustedUntilIso": "2026-11-26T08:00:00.000Z",
+        "lastError": "{\"error\":{\"code\":429,\"message\":\"You exceeded your current quota, please check your plan and billing details. For more information on this error, head to: https://aistudio.google.com/docs/rate-limits. To monitor your current usage, head to: https://ai.dev/rate-limit. \\n* Quota exceeded for metric: ge",
+        "observedDailyLimit": 10
+      },
+      "gemini-4-hydrogen": {
+        "model": "gemini-4-hydrogen",
+        "datePt": "2026-11-25",
+        "requestCount": 2,
+        "minIntervalMs": 1200,
+        "lastRequestAtMs": 1795676134760,
+        "exhaustedUntilIso": "2026-11-26T08:00:00.000Z",
+        "lastError": "{\"error\":{\"code\":429,\"message\":\"You exceeded your current quota, please check your plan and billing details. For more information on this error, head to: https://aistudio.google.com/docs/rate-limits. To monitor your current usage, head to: https://ai.dev/rate-limit. \\n* Quota exceeded for metric: ge",
+        "observedDailyLimit": 20
+      },
+      "gemini-3.5-transcribe": {
+        "model": "gemini-3.5-transcribe",
+        "datePt": "2026-11-25",
+        "requestCount": 2,
+        "minIntervalMs": 1200,
+        "lastRequestAtMs": 1795676170843
+      },
+      "gemini-3.1-flash-lite": {
+        "model": "gemini-3.1-flash-lite",
+        "datePt": "2026-11-25",
+        "requestCount": 4,
+        "minIntervalMs": 1200,
+        "lastRequestAtMs": 1795676175907
+      }
+    },
+    "updatedAt": "2026-11-26T06:56:15.907Z",
+    "keyFingerprint": "9a187ae58704"
   }
 }

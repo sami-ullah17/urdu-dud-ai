@@ -295,9 +295,9 @@ export async function renderMixedVoiceTrack(
   workDir: string,
   outVoiceWavPath: string
 ): Promise<void> {
-  const activeSegments = segments.filter(
-    (s) => s.timedWavPath && fs.existsSync(s.timedWavPath)
-  );
+  const activeSegments = segments
+    .filter((s) => s.timedWavPath && fs.existsSync(s.timedWavPath))
+    .sort((a, b) => a.startSec - b.startSec);
 
   // Create silent stereo base track matching total movie duration
   if (activeSegments.length === 0) {
@@ -316,19 +316,36 @@ export async function renderMixedVoiceTrack(
     return;
   }
 
-  // Mix in hierarchical batches of 14 segments so even 3-hour movies with 2,000+ lines never overflow CLI args
+  interface PositionedClip {
+    filePath: string;
+    startSec: number;
+    durationSec: number;
+    temp: boolean;
+  }
+
+  // Mix in localized hierarchical batches of 14 segments so even 3-hour movies with 2,000+ lines
+  // never overflow CLI args or allocate 3-hour WAV files per batch
   const batchSize = 14;
-  const batchOutputs: string[] = [];
+  const batchClips: PositionedClip[] = [];
 
   for (let i = 0; i < activeSegments.length; i += batchSize) {
     const batch = activeSegments.slice(i, i + batchSize);
+    const clipDurs = await Promise.all(batch.map((s) => probeAudioDuration(s.timedWavPath!)));
+    const batchStart = Math.max(0, Math.min(...batch.map((s) => s.startSec)));
+    let batchEnd = batchStart + 0.5;
+    batch.forEach((seg, idx) => {
+      const end = seg.startSec + Math.max(0.25, clipDurs[idx] || 1);
+      if (end > batchEnd) batchEnd = end;
+    });
+    const spanSec = Math.max(0.5, batchEnd - batchStart + 0.1);
+
     const batchWav = path.join(workDir, `voice_batch_${i}.wav`);
     const args: string[] = [
       '-y',
       '-f',
       'lavfi',
       '-t',
-      totalDurationSec.toFixed(3),
+      spanSec.toFixed(3),
       '-i',
       'anullsrc=r=48000:cl=stereo',
     ];
@@ -338,7 +355,7 @@ export async function renderMixedVoiceTrack(
     batch.forEach((seg, idx) => {
       args.push('-i', seg.timedWavPath!);
       const inputIdx = idx + 1;
-      const delayMs = Math.max(0, Math.round(seg.startSec * 1000));
+      const delayMs = Math.max(0, Math.round((seg.startSec - batchStart) * 1000));
       filterParts.push(`[${inputIdx}:a]adelay=${delayMs}|${delayMs}[d${inputIdx}]`);
       mixInputs.push(`[d${inputIdx}]`);
     });
@@ -354,7 +371,7 @@ export async function renderMixedVoiceTrack(
       '-map',
       '[out]',
       '-t',
-      totalDurationSec.toFixed(3),
+      spanSec.toFixed(3),
       '-acodec',
       'pcm_s16le',
       '-ar',
@@ -364,30 +381,63 @@ export async function renderMixedVoiceTrack(
       batchWav,
     ]);
 
-    batchOutputs.push(batchWav);
+    batchClips.push({
+      filePath: batchWav,
+      startSec: batchStart,
+      durationSec: spanSec,
+      temp: true,
+    });
   }
 
-  // Combine batch tracks (iteratively if > 14 batches)
-  let currentLevel = batchOutputs;
+  // Combine positioned clips hierarchically, freeing consumed temporary batch files
+  let currentLevel = batchClips;
   let round = 0;
   while (currentLevel.length > 1) {
-    const nextLevel: string[] = [];
+    const nextLevel: PositionedClip[] = [];
     for (let i = 0; i < currentLevel.length; i += batchSize) {
       const group = currentLevel.slice(i, i + batchSize);
       if (group.length === 1) {
         nextLevel.push(group[0]);
         continue;
       }
+
+      const groupStart = Math.max(0, Math.min(...group.map((g) => g.startSec)));
+      const groupEnd = Math.max(...group.map((g) => g.startSec + g.durationSec));
+      const spanSec = Math.max(0.5, groupEnd - groupStart + 0.1);
       const mergedPath = path.join(workDir, `voice_merge_r${round}_${i}.wav`);
-      const args: string[] = ['-y'];
-      group.forEach((file) => args.push('-i', file));
-      const inputs = group.map((_, idx) => `[${idx}:a]`).join('');
+
+      const args: string[] = [
+        '-y',
+        '-f',
+        'lavfi',
+        '-t',
+        spanSec.toFixed(3),
+        '-i',
+        'anullsrc=r=48000:cl=stereo',
+      ];
+      const filterParts: string[] = [];
+      const mixInputs: string[] = ['[0:a]'];
+
+      group.forEach((clip, idx) => {
+        args.push('-i', clip.filePath);
+        const inputIdx = idx + 1;
+        const delayMs = Math.max(0, Math.round((clip.startSec - groupStart) * 1000));
+        filterParts.push(`[${inputIdx}:a]adelay=${delayMs}|${delayMs}[m${inputIdx}]`);
+        mixInputs.push(`[m${inputIdx}]`);
+      });
+
+      filterParts.push(
+        `${mixInputs.join('')}amix=inputs=${mixInputs.length}:duration=first:normalize=0[out]`
+      );
+
       await runProcess('ffmpeg', [
         ...args,
         '-filter_complex',
-        `${inputs}amix=inputs=${group.length}:duration=first:normalize=0[out]`,
+        filterParts.join(';'),
         '-map',
         '[out]',
+        '-t',
+        spanSec.toFixed(3),
         '-acodec',
         'pcm_s16le',
         '-ar',
@@ -396,13 +446,62 @@ export async function renderMixedVoiceTrack(
         '2',
         mergedPath,
       ]);
-      nextLevel.push(mergedPath);
+
+      for (const clip of group) {
+        if (clip.temp && fs.existsSync(clip.filePath)) {
+          try {
+            fs.unlinkSync(clip.filePath);
+          } catch {
+            // non-fatal cleanup
+          }
+        }
+      }
+
+      nextLevel.push({
+        filePath: mergedPath,
+        startSec: groupStart,
+        durationSec: spanSec,
+        temp: true,
+      });
     }
     currentLevel = nextLevel;
     round += 1;
   }
 
-  fs.copyFileSync(currentLevel[0], outVoiceWavPath);
+  const rootClip = currentLevel[0];
+  const rootDelayMs = Math.max(0, Math.round(rootClip.startSec * 1000));
+  await runProcess('ffmpeg', [
+    '-y',
+    '-f',
+    'lavfi',
+    '-t',
+    totalDurationSec.toFixed(3),
+    '-i',
+    'anullsrc=r=48000:cl=stereo',
+    '-i',
+    rootClip.filePath,
+    '-filter_complex',
+    `[1:a]adelay=${rootDelayMs}|${rootDelayMs}[d1];[0:a][d1]amix=inputs=2:duration=first:normalize=0[out]`,
+    '-map',
+    '[out]',
+    '-t',
+    totalDurationSec.toFixed(3),
+    '-acodec',
+    'pcm_s16le',
+    '-ar',
+    '48000',
+    '-ac',
+    '2',
+    outVoiceWavPath,
+  ]);
+
+  if (rootClip.temp && fs.existsSync(rootClip.filePath)) {
+    try {
+      fs.unlinkSync(rootClip.filePath);
+    } catch {
+      // non-fatal cleanup
+    }
+  }
 }
 
 export async function mixVoiceAndBackground(

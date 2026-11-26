@@ -212,6 +212,13 @@ export async function startDubbingJob(
   return res.movie;
 }
 
+export async function resumeDubbingJob(id: string): Promise<MovieProject> {
+  const res = await apiFetch<{ movie: MovieProject }>(`/api/dubbing/${id}/resume`, {
+    method: 'POST',
+  });
+  return res.movie;
+}
+
 export async function cancelDubbingJob(id: string): Promise<MovieProject> {
   const res = await apiFetch<{ movie: MovieProject }>(`/api/dubbing/${id}/cancel`, {
     method: 'POST',

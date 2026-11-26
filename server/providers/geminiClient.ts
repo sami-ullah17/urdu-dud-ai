@@ -10,23 +10,40 @@ export class ProviderNotConfiguredError extends Error {
 
 export class JobCancelledError extends Error {
   readonly code = 'JOB_CANCELLED';
-  constructor(message = 'Job was cancelled by user.') {
+  constructor(message = 'Job was paused or cancelled by user.') {
     super(message);
     this.name = 'JOB_CANCELLED';
   }
 }
 
-export type ErrorCategory = 'permanent' | 'temporary' | 'cancelled';
+export class QuotaExhaustedError extends Error {
+  readonly code = 'QUOTA_EXHAUSTED';
+  readonly model: string;
+  readonly resetAtIso: string;
+  readonly isDailyLimit: boolean;
+
+  constructor(model: string, resetAtIso: string, message: string, isDailyLimit = true) {
+    super(message);
+    this.name = 'QUOTA_EXHAUSTED';
+    this.model = model;
+    this.resetAtIso = resetAtIso;
+    this.isDailyLimit = isDailyLimit;
+  }
+}
+
+export type ErrorCategory = 'permanent' | 'temporary' | 'quota' | 'cancelled';
 
 export interface ClassifiedError {
   category: ErrorCategory;
   message: string;
   isTimeout: boolean;
   isRateLimit: boolean;
+  isDailyQuota: boolean;
   retryAfterMs?: number;
+  observedLimit?: number;
 }
 
-function parseRetryAfterMs(rawMsg: string): number | undefined {
+export function parseRetryAfterMs(rawMsg: string): number | undefined {
   // Matches Gemini messages like "Please retry in 21.085129121s." or `"retryDelay":"21s"`
   const secMatch = rawMsg.match(/retry in\s+(\d+(?:\.\d+)?)s/i);
   if (secMatch?.[1]) {
@@ -45,6 +62,15 @@ function parseRetryAfterMs(rawMsg: string): number | undefined {
   return undefined;
 }
 
+function parseObservedQuotaValue(rawMsg: string): number | undefined {
+  const m = rawMsg.match(/"quotaValue"\s*:\s*"(\d+)"/i);
+  if (m?.[1]) {
+    const val = Number(m[1]);
+    if (Number.isFinite(val) && val >= 0) return val;
+  }
+  return undefined;
+}
+
 export function classifyGeminiError(err: unknown): ClassifiedError {
   if (err instanceof JobCancelledError) {
     return {
@@ -52,6 +78,17 @@ export function classifyGeminiError(err: unknown): ClassifiedError {
       message: err.message,
       isTimeout: false,
       isRateLimit: false,
+      isDailyQuota: false,
+    };
+  }
+
+  if (err instanceof QuotaExhaustedError) {
+    return {
+      category: 'quota',
+      message: err.message,
+      isTimeout: false,
+      isRateLimit: true,
+      isDailyQuota: err.isDailyLimit,
     };
   }
 
@@ -59,11 +96,37 @@ export function classifyGeminiError(err: unknown): ClassifiedError {
   const name = err instanceof Error ? err.name : '';
   const lower = rawMsg.toLowerCase();
 
-  // Check permanent errors (auth/permission/missing file/daily hard quota exhausted)
-  const isDailyQuotaExhausted =
-    lower.includes('perday') ||
-    lower.includes('daily') && lower.includes('quota');
+  const isRateLimit =
+    lower.includes('resource_exhausted') ||
+    lower.includes('"code":429') ||
+    lower.includes('429 too many requests') ||
+    lower.includes('exceeded your current quota') ||
+    lower.includes('rate-limit') ||
+    lower.includes('per minute limit');
 
+  const isDailyQuota =
+    isRateLimit &&
+    (lower.includes('perday') ||
+      lower.includes('requestsperday') ||
+      lower.includes('per_day') ||
+      (lower.includes('daily') && lower.includes('quota')) ||
+      lower.includes('"quotavalue":"0"') ||
+      lower.includes('limit: 0'));
+
+  if (isRateLimit) {
+    const retryAfterMs = parseRetryAfterMs(rawMsg);
+    return {
+      category: 'quota',
+      message: rawMsg,
+      isTimeout: false,
+      isRateLimit: true,
+      isDailyQuota: isDailyQuota || retryAfterMs === undefined,
+      retryAfterMs,
+      observedLimit: isDailyQuota ? parseObservedQuotaValue(rawMsg) : undefined,
+    };
+  }
+
+  // Permanent non-quota errors (auth/permission/missing file/bad input)
   if (
     err instanceof ProviderNotConfiguredError ||
     lower.includes('api_key_invalid') ||
@@ -77,14 +140,14 @@ export function classifyGeminiError(err: unknown): ClassifiedError {
     lower.includes('unsupported mime') ||
     lower.includes('invalid argument') ||
     lower.includes('invalid_argument') ||
-    lower.includes('file does not exist') ||
-    isDailyQuotaExhausted
+    lower.includes('file does not exist')
   ) {
     return {
       category: 'permanent',
       message: rawMsg,
       isTimeout: false,
-      isRateLimit: isDailyQuotaExhausted,
+      isRateLimit: false,
+      isDailyQuota: false,
     };
   }
 
@@ -97,20 +160,12 @@ export function classifyGeminiError(err: unknown): ClassifiedError {
     lower.includes('etimedout') ||
     lower.includes('504');
 
-  const isRateLimit =
-    lower.includes('resource_exhausted') ||
-    lower.includes('"code":429') ||
-    lower.includes('rate-limit') ||
-    lower.includes('per minute limit');
-
-  const retryAfterMs = isRateLimit ? parseRetryAfterMs(rawMsg) : undefined;
-
   return {
     category: 'temporary',
     message: rawMsg,
     isTimeout,
-    isRateLimit,
-    retryAfterMs,
+    isRateLimit: false,
+    isDailyQuota: false,
   };
 }
 
@@ -189,16 +244,18 @@ export async function withRetry<T>(
       );
       options.onAttemptError?.(attempt, maxAttempts, classified, elapsedMs);
 
-      if (classified.category === 'cancelled' || classified.category === 'permanent' || attempt === maxAttempts) {
+      // Never continuously retry quota errors, permanent errors, or cancelled jobs
+      if (
+        classified.category === 'cancelled' ||
+        classified.category === 'permanent' ||
+        classified.category === 'quota' ||
+        attempt === maxAttempts
+      ) {
         throw err;
       }
 
       const expDelay = Math.min(maxDelayMs, baseDelayMs * Math.pow(2, attempt - 1));
-      // Honor server-specified 429 retryDelay (capped at 75s) when present
-      const delayMs = classified.retryAfterMs
-        ? Math.min(75_000, Math.max(expDelay, classified.retryAfterMs))
-        : expDelay + Math.floor(Math.random() * 600);
-
+      const delayMs = expDelay + Math.floor(Math.random() * 600);
       await sleepWithCancel(delayMs, options.shouldCancel);
     }
   }

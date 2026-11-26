@@ -31,6 +31,7 @@ import {
   hasGeminiKey,
   JobCancelledError,
   ProviderNotConfiguredError,
+  QuotaExhaustedError,
   sleepWithCancel,
 } from './providers/geminiClient.ts';
 import {
@@ -98,12 +99,49 @@ function cleanupWorkDir(movieWorkDir: string) {
   }
 }
 
+export function computeTtsChunkCounts(segments: DialogueSegment[]) {
+  const totalTtsChunks = segments.length;
+  const completedTtsChunks = segments.filter((s) => s.ttsStatus === 'completed').length;
+  const failedTtsChunks = segments.filter((s) => s.ttsStatus === 'failed').length;
+  const remainingTtsChunks = Math.max(0, totalTtsChunks - completedTtsChunks);
+  return {
+    totalTtsChunks,
+    completedTtsChunks,
+    failedTtsChunks,
+    remainingTtsChunks,
+  };
+}
+
+function revertProcessingStatesToPending(
+  chunkStates: ChunkState[],
+  segments: DialogueSegment[]
+) {
+  for (const ch of chunkStates) {
+    if (ch.status === 'processing') {
+      ch.status = 'pending';
+    }
+  }
+  for (const seg of segments) {
+    if (seg.ttsStatus === 'processing') {
+      seg.ttsStatus = 'pending';
+    }
+  }
+}
+
 export function enqueueDubbingJob(movieId: string, mode: JobMode, demoMode = false): void {
   cancelledMovies.delete(movieId);
 
   if (runningMovies.has(movieId)) {
     return;
   }
+  const existing = getMovie(movieId);
+  const resolvedTargetMode: 'scan' | 'full' =
+    mode === 'scan'
+      ? 'scan'
+      : mode === 'full'
+        ? 'full'
+        : existing?.targetMode ?? 'full';
+
   const existingIdx = activeQueue.findIndex((j) => j.movieId === movieId);
   if (existingIdx >= 0) {
     activeQueue[existingIdx] = { movieId, mode, demoMode };
@@ -112,6 +150,10 @@ export function enqueueDubbingJob(movieId: string, mode: JobMode, demoMode = fal
   }
   updateMovie(movieId, {
     status: mode === 'scan' ? 'scanning' : 'queued',
+    targetMode: resolvedTargetMode,
+    pauseReason: undefined,
+    pausedAt: undefined,
+    quotaResetAt: undefined,
     error: undefined,
     demoMode,
   });
@@ -136,16 +178,26 @@ export function cancelDubbingJob(movieId: string): MovieProject | undefined {
   if (!movie) return undefined;
 
   if (!runningMovies.has(movieId)) {
+    const chunkStates = [...movie.chunkStates];
+    const segments = [...movie.segments];
+    revertProcessingStatesToPending(chunkStates, segments);
+    const ttsCounts = computeTtsChunkCounts(segments);
+
     const updated = updateMovie(movieId, {
-      status: 'failed',
-      error: 'Job cancelled by user. Completed chunks are preserved — click Retry Failed Chunks to resume.',
+      status: 'paused',
+      pauseReason: 'user_paused',
+      pausedAt: new Date().toISOString(),
+      chunkStates,
+      segments,
+      ...ttsCounts,
+      error: 'Processing paused by user. All completed chunks are saved — click "Resume Processing" anytime to continue.',
       etaSeconds: null,
     });
     appendMovieLog(
       movieId,
       'System',
       'warn',
-      'Job cancelled while queued. Completed chunks preserved.'
+      'Processing paused while queued. Completed chunks preserved.'
     );
     return updated;
   }
@@ -154,7 +206,7 @@ export function cancelDubbingJob(movieId: string): MovieProject | undefined {
     movieId,
     'System',
     'warn',
-    'Cancellation requested; stopping after current step while preserving completed chunks.'
+    'Pause requested; stopping after current API request while preserving all completed chunks.'
   );
   return getMovie(movieId);
 }
@@ -191,23 +243,64 @@ async function drainQueue(): Promise<void> {
       try {
         await executeDubbingJob(next.movieId, next.mode, next.demoMode);
       } catch (err) {
-        const msg =
-          err instanceof JobCancelledError
-            ? 'Job cancelled by user. Completed chunks are preserved — click Retry Failed Chunks to resume.'
-            : err instanceof Error
-              ? err.message
-              : String(err);
-        updateMovie(next.movieId, {
-          status: 'failed',
-          error: msg,
-          etaSeconds: null,
-        });
-        appendMovieLog(
-          next.movieId,
-          'System',
-          err instanceof JobCancelledError ? 'warn' : 'error',
-          err instanceof JobCancelledError ? msg : `Job failed: ${msg}`
-        );
+        const latest = getMovie(next.movieId);
+        const chunkStates = latest ? [...latest.chunkStates] : [];
+        const segments = latest ? [...latest.segments] : [];
+
+        if (err instanceof QuotaExhaustedError) {
+          revertProcessingStatesToPending(chunkStates, segments);
+          const ttsCounts = computeTtsChunkCounts(segments);
+          const doneAsr = chunkStates.filter((c) => c.status === 'completed').length;
+          const totalAsr = chunkStates.length;
+
+          const pauseMsg =
+            `Paused automatically: Gemini API daily quota reached (${err.model}). ` +
+            `${doneAsr}/${totalAsr} speech chunks and ${ttsCounts.completedTtsChunks}/${ttsCounts.totalTtsChunks} Urdu audio chunks are safely saved. ` +
+            `Click "Resume Processing" after quota resets (typically the next day) without re-uploading. ` +
+            `Completion timing depends on Google's active Free Tier quotas, which may change.`;
+
+          updateMovie(next.movieId, {
+            status: 'paused',
+            pauseReason: 'quota_exhausted',
+            pausedAt: new Date().toISOString(),
+            quotaResetAt: err.resetAtIso,
+            etaSeconds: null,
+            chunkStates,
+            segments,
+            completedChunks: doneAsr,
+            failedChunks: chunkStates.filter((c) => c.status === 'failed').length,
+            ...ttsCounts,
+            error: pauseMsg,
+          });
+          appendMovieLog(next.movieId, 'System', 'warn', pauseMsg);
+        } else if (err instanceof JobCancelledError) {
+          revertProcessingStatesToPending(chunkStates, segments);
+          const ttsCounts = computeTtsChunkCounts(segments);
+          const msg =
+            'Processing paused by user. Completed chunks are saved — click "Resume Processing" to continue from the last incomplete chunk.';
+
+          updateMovie(next.movieId, {
+            status: 'paused',
+            pauseReason: 'user_paused',
+            pausedAt: new Date().toISOString(),
+            etaSeconds: null,
+            chunkStates,
+            segments,
+            completedChunks: chunkStates.filter((c) => c.status === 'completed').length,
+            failedChunks: chunkStates.filter((c) => c.status === 'failed').length,
+            ...ttsCounts,
+            error: msg,
+          });
+          appendMovieLog(next.movieId, 'System', 'warn', msg);
+        } else {
+          const msg = err instanceof Error ? err.message : String(err);
+          updateMovie(next.movieId, {
+            status: 'failed',
+            etaSeconds: null,
+            error: msg,
+          });
+          appendMovieLog(next.movieId, 'System', 'error', `Job failed: ${msg}`);
+        }
       } finally {
         runningMovies.delete(next.movieId);
         cancelledMovies.delete(next.movieId);
@@ -291,6 +384,13 @@ async function executeDubbingJob(
     );
   }
 
+  const effectiveTargetMode: 'scan' | 'full' =
+    mode === 'scan'
+      ? 'scan'
+      : mode === 'full'
+        ? 'full'
+        : movie.targetMode ?? 'full';
+
   const movieWorkDir = path.join(WORK_DIR, movieId);
   const chunksDir = path.join(movieWorkDir, 'chunks');
   const ttsDir = path.join(movieWorkDir, 'tts');
@@ -299,9 +399,15 @@ async function executeDubbingJob(
   fs.mkdirSync(ttsDir, { recursive: true });
 
   const startedAt = movie.processingStartedAt ?? new Date().toISOString();
+  const previousStatus = movie.status;
+
   updateMovie(movieId, {
-    status: mode === 'scan' ? 'scanning' : 'processing',
+    status: effectiveTargetMode === 'scan' ? 'scanning' : 'processing',
+    targetMode: effectiveTargetMode,
     processingStartedAt: startedAt,
+    pauseReason: undefined,
+    pausedAt: undefined,
+    quotaResetAt: undefined,
     error: undefined,
     demoMode,
   });
@@ -328,10 +434,13 @@ async function executeDubbingJob(
     fs.existsSync(fullStereoWav) && fs.statSync(fullStereoWav).size > 4096;
   const hasCompletedScan =
     mode === 'full' &&
-    movie.status === 'ready_for_dubbing' &&
+    previousStatus === 'ready_for_dubbing' &&
     movie.chunkStates.length > 0 &&
     movie.chunkStates.every((c) => c.status === 'completed');
-  const preserveCompletedChunks = mode === 'resume_chunks' || hasCompletedScan;
+  const preserveCompletedChunks =
+    mode === 'resume_chunks' ||
+    hasCompletedScan ||
+    (previousStatus === 'paused' && movie.chunkStates.length > 0);
 
   if (preserveCompletedChunks && hasExistingWav) {
     appendMovieLog(
@@ -391,7 +500,7 @@ async function executeDubbingJob(
       movieId,
       'Detecting Turkish speech',
       'info',
-      `Resuming persisted schedule: ${completedCount}/${chunkStates.length} chunk(s) already completed and preserved.`
+      `Resuming persisted schedule: ${completedCount}/${chunkStates.length} speech chunk(s) already completed and preserved.`
     );
   } else {
     chunks = await splitAudioIntoChunks(
@@ -426,7 +535,7 @@ async function executeDubbingJob(
     chunkStates,
   });
 
-  // Clearly labeled Demo Mode pipeline (only when user explicitly selects Demo Mode because API key is missing)
+  // Clearly labeled Demo Mode pipeline
   if (demoMode) {
     setStage(movieId, 3, 40, 6);
     appendMovieLog(
@@ -440,6 +549,7 @@ async function executeDubbingJob(
     for (const seg of demoSegs) {
       const char = mergeSpeakerIntoRoster(movie, roster, seg);
       seg.voiceProfileId = char.voiceProfileId;
+      seg.ttsStatus = 'completed';
     }
 
     setStage(movieId, 7, 72, 3);
@@ -461,6 +571,7 @@ async function executeDubbingJob(
       etaSeconds: 0,
       completedChunks: chunks.length,
       failedChunks: 0,
+      ...computeTtsChunkCounts(demoSegs),
       chunkStates: chunkStates.map((c) => ({ ...c, status: 'completed' })),
       characters: roster,
       segments: demoSegs,
@@ -485,7 +596,7 @@ async function executeDubbingJob(
   if (preserveCompletedChunks) {
     for (const seg of movie.segments) {
       const arr = existingSegmentsByChunk.get(seg.chunkIndex) ?? [];
-      arr.push(seg);
+      arr.push({ ...seg });
       existingSegmentsByChunk.set(seg.chunkIndex, arr);
     }
   }
@@ -501,12 +612,18 @@ async function executeDubbingJob(
     const chunk = chunks[i];
     const state = chunkStates[i];
 
-    // Preserve completed chunks even if a silent/music-only chunk had 0 dialogue segments
+    // Preserve completed ASR/translation chunks even if a silent/music-only chunk had 0 dialogue segments
     if (preserveCompletedChunks && state.status === 'completed') {
       const preserved = existingSegmentsByChunk.get(i) ?? [];
       for (const seg of preserved) {
         const char = mergeSpeakerIntoRoster(movie, roster, seg);
-        seg.voiceProfileId = char.voiceProfileId;
+        if (seg.voiceProfileId !== char.voiceProfileId) {
+          seg.voiceProfileId = char.voiceProfileId;
+          if (seg.ttsStatus === 'completed' && seg.ttsVoiceProfileId && seg.ttsVoiceProfileId !== char.voiceProfileId) {
+            seg.ttsStatus = 'pending';
+            seg.timedWavPath = undefined;
+          }
+        }
         allSegments.push(seg);
       }
       continue;
@@ -521,7 +638,6 @@ async function executeDubbingJob(
     let lastChunkErr = '';
     let isPermanentErr = false;
 
-    // Smart retry loop: up to 5 attempts with exponential backoff for transient errors
     for (let attempt = 1; attempt <= MAX_CHUNK_ATTEMPTS; attempt++) {
       if (isJobCancelled(movieId)) {
         throw new JobCancelledError();
@@ -541,7 +657,7 @@ async function executeDubbingJob(
           avgChunkMs !== null ? Math.round((avgChunkMs * remainingChunks) / 1000) + 12 : null;
 
         // Stage 4: Transcribing dialogue + Stage 5: Identifying speakers
-        const basePct = 18 + (completedCount / Math.max(1, chunks.length)) * 52;
+        const basePct = 18 + (completedCount / Math.max(1, chunks.length)) * 36;
         setStage(movieId, 3, basePct, etaSec);
 
         const diarizedLines = await asrAdapter.transcribeAndDiarizeChunk({
@@ -554,13 +670,13 @@ async function executeDubbingJob(
           onLog: (level, msg) => appendMovieLog(movieId, 'Transcribing dialogue', level, msg),
         });
 
-        setStage(movieId, 4, basePct + 14 / Math.max(1, chunks.length), etaSec);
+        setStage(movieId, 4, basePct + 10 / Math.max(1, chunks.length), etaSec);
 
         // Deduplicate lines captured inside overlap region from previous chunk
         const freshLines = deduplicateBoundaryLines(allSegments, diarizedLines);
 
         // Stage 6: Translating Turkish into Urdu
-        setStage(movieId, 5, basePct + 28 / Math.max(1, chunks.length), etaSec);
+        setStage(movieId, 5, basePct + 18 / Math.max(1, chunks.length), etaSec);
         const translations =
           freshLines.length > 0
             ? await translationAdapter.translateBatch({
@@ -574,6 +690,7 @@ async function executeDubbingJob(
                   durationSec: Math.max(0.8, l.endSec - l.startSec),
                 })),
                 shouldCancel: () => isJobCancelled(movieId),
+                onLog: (level, msg) => appendMovieLog(movieId, 'Translating Turkish into Urdu', level, msg),
               })
             : [];
 
@@ -603,6 +720,8 @@ async function executeDubbingJob(
             urduText,
             emotion: line.emotion,
             voiceProfileId: char.voiceProfileId,
+            ttsStatus: 'pending',
+            ttsAttempts: 0,
           });
         }
 
@@ -616,26 +735,26 @@ async function executeDubbingJob(
           movieId,
           'Translating Turkish into Urdu',
           'info',
-          `Chunk ${i + 1}/${chunks.length} completed (${freshLines.length} dialogue lines, ${(elapsed / 1000).toFixed(1)}s${attempt > 1 ? `, recovered on attempt ${attempt}` : ''}).`
+          `Speech chunk ${i + 1}/${chunks.length} completed (${freshLines.length} dialogue lines, ${(elapsed / 1000).toFixed(1)}s${attempt > 1 ? `, recovered on attempt ${attempt}` : ''}).`
         );
         break;
       } catch (err) {
-        const classified = classifyGeminiError(err);
-        lastChunkErr = classified.message;
-
-        if (classified.category === 'cancelled') {
-          state.status = 'failed';
-          state.error = 'Cancelled by user';
+        if (err instanceof QuotaExhaustedError || err instanceof JobCancelledError) {
+          // Persist all earlier chunks and revert current chunk cleanly before propagating pause
+          state.status = 'pending';
           updateMovie(movieId, {
             chunkStates: [...chunkStates],
             completedChunks: chunkStates.filter((c) => c.status === 'completed').length,
             failedChunks: chunkStates.filter((c) => c.status === 'failed').length,
             characters: roster,
             segments: allSegments,
+            ...computeTtsChunkCounts(allSegments),
           });
           throw err;
         }
 
+        const classified = classifyGeminiError(err);
+        lastChunkErr = classified.message;
         isPermanentErr = classified.category === 'permanent';
         appendMovieLog(
           movieId,
@@ -662,6 +781,7 @@ async function executeDubbingJob(
         failedChunks: chunkStates.filter((c) => c.status === 'failed').length,
         characters: roster,
         segments: allSegments,
+        ...computeTtsChunkCounts(allSegments),
       });
       throw new Error(
         isPermanentErr
@@ -671,7 +791,7 @@ async function executeDubbingJob(
     }
 
     const doneNow = chunkStates.filter((c) => c.status === 'completed').length;
-    const progressNow = 18 + (doneNow / Math.max(1, chunks.length)) * 52;
+    const progressNow = 18 + (doneNow / Math.max(1, chunks.length)) * 36;
     updateMovie(movieId, {
       chunkStates: [...chunkStates],
       completedChunks: doneNow,
@@ -679,13 +799,14 @@ async function executeDubbingJob(
       progressPercent: Math.round(progressNow),
       characters: roster,
       segments: allSegments,
+      ...computeTtsChunkCounts(allSegments),
     });
   }
 
   allSegments.sort((a, b) => a.startSec - b.startSec);
 
   // If user requested speaker discovery scan only, stop cleanly so they can customize character voices
-  if (mode === 'scan') {
+  if (effectiveTargetMode === 'scan') {
     updateMovie(movieId, {
       status: 'ready_for_dubbing',
       currentStage: 'Identifying speakers',
@@ -694,6 +815,7 @@ async function executeDubbingJob(
       etaSeconds: null,
       characters: roster,
       segments: allSegments,
+      ...computeTtsChunkCounts(allSegments),
     });
     appendMovieLog(
       movieId,
@@ -711,63 +833,153 @@ async function executeDubbingJob(
   for (const seg of allSegments) {
     const locked = lockedMap.get(seg.speakerLabel);
     if (locked) {
+      const voiceChanged =
+        seg.ttsStatus === 'completed' &&
+        seg.ttsVoiceProfileId &&
+        seg.ttsVoiceProfileId !== locked.voiceProfileId;
       seg.voiceProfileId = locked.voiceProfileId;
       seg.gender = locked.gender;
+      if (voiceChanged) {
+        seg.ttsStatus = 'pending';
+        seg.timedWavPath = undefined;
+      }
     }
   }
 
+  // Normalize initial TTS status from disk cache so previously synthesized chunks are never regenerated
+  for (let idx = 0; idx < allSegments.length; idx++) {
+    const seg = allSegments[idx];
+    const voiceProfile =
+      URDU_VOICE_PROFILES.find((v) => v.id === seg.voiceProfileId) ?? URDU_VOICE_PROFILES[0];
+    const deterministicTimed = path.join(ttsDir, `timed_${seg.id}_${voiceProfile.id}.wav`);
+    const legacyTimed = path.join(ttsDir, `timed_${idx}_${voiceProfile.id}.wav`);
+
+    if (!fs.existsSync(deterministicTimed) && fs.existsSync(legacyTimed) && fs.statSync(legacyTimed).size > 1024) {
+      fs.copyFileSync(legacyTimed, deterministicTimed);
+    }
+
+    if (fs.existsSync(deterministicTimed) && fs.statSync(deterministicTimed).size > 1024) {
+      seg.ttsStatus = 'completed';
+      seg.ttsVoiceProfileId = voiceProfile.id;
+      seg.timedWavPath = deterministicTimed;
+      seg.ttsError = undefined;
+    } else if (seg.ttsStatus === 'completed' && !fs.existsSync(deterministicTimed)) {
+      // Missing file on disk means we must synthesize it cleanly
+      seg.ttsStatus = 'pending';
+      seg.timedWavPath = undefined;
+    } else if (!seg.ttsStatus) {
+      seg.ttsStatus = 'pending';
+    }
+  }
+
+  const initialTtsCounts = computeTtsChunkCounts(allSegments);
+  updateMovie(movieId, {
+    characters: lockedRoster,
+    segments: allSegments,
+    ...initialTtsCounts,
+  });
+
   // Stage 7: Generating Urdu voices + Stage 8: Synchronizing dialogue
-  setStage(movieId, 6, 72, null);
+  setStage(
+    movieId,
+    6,
+    55 + (initialTtsCounts.completedTtsChunks / Math.max(1, allSegments.length)) * 35,
+    null
+  );
   appendMovieLog(
     movieId,
     'Generating Urdu voices',
     'info',
-    `Synthesizing ${allSegments.length} Pakistani Urdu dialogue tracks with consistent character voices.`
+    `Urdu TTS queue: ${initialTtsCounts.completedTtsChunks}/${initialTtsCounts.totalTtsChunks} audio chunk(s) already completed; ${initialTtsCounts.remainingTtsChunks} pending.`
   );
 
-  const ttsDurations: number[] = [];
   for (let idx = 0; idx < allSegments.length; idx++) {
     if (isJobCancelled(movieId)) {
       throw new JobCancelledError();
     }
 
     const seg = allSegments[idx];
-    const t0 = Date.now();
     const voiceProfile =
       URDU_VOICE_PROFILES.find((v) => v.id === seg.voiceProfileId) ?? URDU_VOICE_PROFILES[0];
 
-    const rawWav = path.join(ttsDir, `raw_${idx}_${voiceProfile.id}.wav`);
-    const timedWav = path.join(ttsDir, `timed_${idx}_${voiceProfile.id}.wav`);
+    const rawWav = path.join(ttsDir, `raw_${seg.id}_${voiceProfile.id}.wav`);
+    const timedWav = path.join(ttsDir, `timed_${seg.id}_${voiceProfile.id}.wav`);
 
-    const hasCachedTimed = fs.existsSync(timedWav) && fs.statSync(timedWav).size > 1024;
-    if (!hasCachedTimed) {
+    // Skip already completed Urdu audio chunks without regenerating
+    if (
+      seg.ttsStatus === 'completed' &&
+      seg.ttsVoiceProfileId === voiceProfile.id &&
+      fs.existsSync(timedWav) &&
+      fs.statSync(timedWav).size > 1024
+    ) {
+      seg.timedWavPath = timedWav;
+      continue;
+    }
+
+    seg.ttsStatus = 'processing';
+    seg.ttsAttempts = (seg.ttsAttempts ?? 0) + 1;
+    seg.ttsError = undefined;
+    updateMovie(movieId, {
+      segments: allSegments,
+      ...computeTtsChunkCounts(allSegments),
+    });
+
+    try {
       await ttsAdapter.synthesizeLine({
         urduText: seg.urduText,
         emotion: seg.emotion,
         voiceProfile,
         outWavPath: rawWav,
         shouldCancel: () => isJobCancelled(movieId),
+        onLog: (level, msg) => appendMovieLog(movieId, 'Generating Urdu voices', level, msg),
       });
 
-      setStage(movieId, 7, 72 + ((idx + 1) / Math.max(1, allSegments.length)) * 16);
+      const countsAfterSynth = computeTtsChunkCounts(allSegments);
+      setStage(
+        movieId,
+        7,
+        55 + ((countsAfterSynth.completedTtsChunks + 0.5) / Math.max(1, allSegments.length)) * 35
+      );
+
       await fitSegmentTiming(
         rawWav,
         timedWav,
         Math.max(0.6, seg.endSec - seg.startSec),
         voiceProfile.pitchSemitones
       );
-    }
 
-    seg.timedWavPath = timedWav;
-    ttsDurations.push(Date.now() - t0);
+      seg.ttsStatus = 'completed';
+      seg.ttsVoiceProfileId = voiceProfile.id;
+      seg.timedWavPath = timedWav;
+      seg.ttsError = undefined;
+      seg.ttsCompletedAt = new Date().toISOString();
 
-    if ((idx + 1) % 5 === 0 || idx === allSegments.length - 1) {
-      const avgTtsMs = ttsDurations.reduce((a, b) => a + b, 0) / ttsDurations.length;
-      const eta = Math.round(((allSegments.length - idx - 1) * avgTtsMs) / 1000) + 8;
+      const updatedCounts = computeTtsChunkCounts(allSegments);
       updateMovie(movieId, {
-        progressPercent: Math.round(72 + ((idx + 1) / Math.max(1, allSegments.length)) * 16),
-        etaSeconds: eta,
+        progressPercent: Math.round(
+          55 + (updatedCounts.completedTtsChunks / Math.max(1, allSegments.length)) * 35
+        ),
+        segments: allSegments,
+        ...updatedCounts,
       });
+    } catch (err) {
+      if (err instanceof QuotaExhaustedError || err instanceof JobCancelledError) {
+        seg.ttsStatus = 'pending';
+        updateMovie(movieId, {
+          segments: allSegments,
+          ...computeTtsChunkCounts(allSegments),
+        });
+        throw err;
+      }
+
+      const msg = err instanceof Error ? err.message : String(err);
+      seg.ttsStatus = 'failed';
+      seg.ttsError = msg.slice(0, 300);
+      updateMovie(movieId, {
+        segments: allSegments,
+        ...computeTtsChunkCounts(allSegments),
+      });
+      throw new Error(`Urdu audio chunk ${idx + 1}/${allSegments.length} failed: ${msg}`);
     }
   }
 
@@ -776,7 +988,7 @@ async function executeDubbingJob(
   }
 
   // Stage 9: Mixing audio (source separation / SFX preservation + sidechain ducking)
-  setStage(movieId, 8, 90, 6);
+  setStage(movieId, 8, 92, 6);
   const sepUrl = process.env.SOURCE_SEPARATION_URL?.trim();
   const sepMethod = sepUrl
     ? `External Stem Separator (${sepUrl})`
@@ -786,7 +998,7 @@ async function executeDubbingJob(
     movieId,
     'Mixing audio',
     'info',
-    `Isolating background music/SFX (${sepMethod}) and mixing ${allSegments.length} synchronized Urdu lines.`
+    `Isolating background music/SFX (${sepMethod}) and mixing all ${allSegments.length} synchronized Urdu voice chunks.`
   );
 
   const bgBedWav = path.join(movieWorkDir, 'bg_bed.wav');
@@ -806,13 +1018,18 @@ async function executeDubbingJob(
   generateSrtSubtitles(allSegments, outSrtPath);
 
   const mp4Stats = fs.statSync(outMp4Path);
+  const finalTtsCounts = computeTtsChunkCounts(allSegments);
   updateMovie(movieId, {
     status: 'completed',
     currentStage: 'Rendering final MP4',
     stageIndex: 9,
     progressPercent: 100,
     etaSeconds: 0,
+    pauseReason: undefined,
+    pausedAt: undefined,
+    quotaResetAt: undefined,
     characters: lockedRoster,
+    ...finalTtsCounts,
     segments: allSegments.map((s) => ({
       ...s,
       ttsWavPath: undefined,

@@ -20,6 +20,7 @@ export type MovieStatus =
   | 'ready_for_dubbing'
   | 'queued'
   | 'processing'
+  | 'paused'
   | 'completed'
   | 'failed';
 
@@ -136,6 +137,11 @@ export interface DialogueSegment {
   urduText: string;
   emotion: string;
   voiceProfileId: string;
+  ttsStatus?: 'pending' | 'processing' | 'completed' | 'failed';
+  ttsAttempts?: number;
+  ttsError?: string;
+  ttsVoiceProfileId?: string;
+  ttsCompletedAt?: string;
   ttsWavPath?: string;
   timedWavPath?: string;
 }
@@ -158,6 +164,8 @@ export interface ProcessingLogEntry {
   createdAt: string;
 }
 
+export type PauseReason = 'quota_exhausted' | 'user_paused' | 'server_restart';
+
 export interface MovieProject {
   id: string;
   ownerId: string;
@@ -179,6 +187,14 @@ export interface MovieProject {
   totalChunks: number;
   completedChunks: number;
   failedChunks: number;
+  totalTtsChunks?: number;
+  completedTtsChunks?: number;
+  failedTtsChunks?: number;
+  remainingTtsChunks?: number;
+  pauseReason?: PauseReason;
+  pausedAt?: string;
+  quotaResetAt?: string;
+  targetMode?: 'scan' | 'full';
   chunkStates: ChunkState[];
   characters: CharacterProfile[];
   segments: DialogueSegment[];
@@ -215,4 +231,21 @@ export interface StudioUser {
   displayName: string;
   shortClipVerified: boolean;
   createdAt: string;
+}
+
+export interface ModelQuotaRecord {
+  model: string;
+  datePt: string;
+  requestCount: number;
+  exhaustedUntilIso?: string;
+  lastError?: string;
+  observedDailyLimit?: number;
+  lastRequestAtMs?: number;
+  minIntervalMs?: number;
+}
+
+export interface QuotaStateStore {
+  keyFingerprint?: string;
+  models: Record<string, ModelQuotaRecord>;
+  updatedAt: string;
 }

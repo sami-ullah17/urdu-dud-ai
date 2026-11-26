@@ -13,8 +13,14 @@ import {
   getGeminiClient,
   hasGeminiKey,
   JobCancelledError,
-  withRetry,
+  QuotaExhaustedError,
 } from './geminiClient.ts';
+import {
+  executeQueuedGeminiCall,
+  getNextPtMidnightIso,
+  getQuotaDiagnostics,
+  isModelQuotaAvailable,
+} from './quotaManager.ts';
 import { extractSingleChunkAudio } from './ffmpegPipeline.ts';
 
 export interface AsrDiarizedLine {
@@ -58,6 +64,7 @@ export interface UrduTranslationProvider {
     }>;
     movieTitle: string;
     shouldCancel?: () => boolean;
+    onLog?: (level: 'info' | 'warn' | 'error', message: string) => void;
   }): Promise<TranslationResultLine[]>;
 }
 
@@ -69,6 +76,7 @@ export interface UrduTtsProvider {
     voiceProfile: UrduVoiceProfile;
     outWavPath: string;
     shouldCancel?: () => boolean;
+    onLog?: (level: 'info' | 'warn' | 'error', message: string) => void;
   }): Promise<void>;
 }
 
@@ -231,8 +239,6 @@ async function prepareAudioPart(
   };
 }
 
-let transcribeCooldownUntil = 0;
-
 export class GeminiTurkishAsrDiarizationAdapter implements TurkishAsrDiarizationProvider {
   readonly name = 'gemini-3.5-transcribe + gemini-4-hydrogen';
 
@@ -328,12 +334,17 @@ export class GeminiTurkishAsrDiarizationAdapter implements TurkishAsrDiarization
     const { part: audioPart, cleanup } = await prepareAudioPart(ai, params.windowAudioPath);
 
     try {
-      // Step A: Dedicated Turkish ASR using gemini-3.5-transcribe with 45s timeout (single fast attempt)
+      // Step A: Dedicated Turkish ASR using gemini-3.5-transcribe if quota is available today
       let rawTranscript = '';
-      if (Date.now() >= transcribeCooldownUntil) {
+      if (isModelQuotaAvailable('gemini-3.5-transcribe')) {
         try {
-          const transcriptResp = await withRetry(
-            () =>
+          const transcriptResp = await executeQueuedGeminiCall({
+            model: 'gemini-3.5-transcribe',
+            label: `transcribe_win_${params.windowLabel}`,
+            maxTransientAttempts: 1,
+            shouldCancel: params.shouldCancel,
+            onLog: params.onLog,
+            fn: () =>
               ai.models.generateContent({
                 model: 'gemini-3.5-transcribe',
                 contents: {
@@ -348,24 +359,12 @@ export class GeminiTurkishAsrDiarizationAdapter implements TurkishAsrDiarization
                   abortSignal: AbortSignal.timeout(45_000),
                 },
               }),
-            {
-              maxAttempts: 1,
-              label: `transcribe_win_${params.windowLabel}`,
-              shouldCancel: params.shouldCancel,
-            }
-          );
+          });
           rawTranscript = (transcriptResp.text ?? '').trim();
         } catch (asrErr) {
           const classified = classifyGeminiError(asrErr);
-          if (
-            classified.category === 'cancelled' ||
-            (classified.category === 'permanent' && !classified.isRateLimit)
-          ) {
+          if (classified.category === 'cancelled' || classified.category === 'permanent') {
             throw asrErr;
-          }
-          if (classified.isRateLimit && classified.category === 'permanent') {
-            // Daily RPD quota hit on gemini-3.5-transcribe; use direct multimodal ASR for 1h without extra wasted 429s
-            transcribeCooldownUntil = Date.now() + 60 * 60 * 1000;
           }
           params.onLog?.(
             'warn',
@@ -422,39 +421,49 @@ If no Turkish speech is spoken in this clip, return [].`;
         },
       };
 
-      // Step B: Structured timestamping + speaker diarization + gender identification (120s timeout)
+      // Step B: Structured timestamping + speaker diarization + gender identification
       let diarizedResp;
-      try {
-        diarizedResp = await withRetry(
-          () =>
-            ai.models.generateContent({
-              model: 'gemini-4-hydrogen',
-              contents: { parts: [audioPart, { text: diarizePrompt }] },
-              config: {
-                abortSignal: AbortSignal.timeout(120_000),
-                thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-                maxOutputTokens: 8192,
-                responseMimeType: 'application/json',
-                responseSchema: diarizeSchema,
-              },
-            }),
-          {
-            maxAttempts: 1,
+      if (isModelQuotaAvailable('gemini-4-hydrogen')) {
+        try {
+          diarizedResp = await executeQueuedGeminiCall({
+            model: 'gemini-4-hydrogen',
             label: `diarize_win_${params.windowLabel}`,
+            maxTransientAttempts: 1,
             shouldCancel: params.shouldCancel,
+            onLog: params.onLog,
+            fn: () =>
+              ai.models.generateContent({
+                model: 'gemini-4-hydrogen',
+                contents: { parts: [audioPart, { text: diarizePrompt }] },
+                config: {
+                  abortSignal: AbortSignal.timeout(120_000),
+                  thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+                  maxOutputTokens: 8192,
+                  responseMimeType: 'application/json',
+                  responseSchema: diarizeSchema,
+                },
+              }),
+          });
+        } catch (primaryErr) {
+          const classified = classifyGeminiError(primaryErr);
+          if (classified.category === 'cancelled' || classified.category === 'permanent') {
+            throw primaryErr;
           }
-        );
-      } catch (primaryErr) {
-        const classified = classifyGeminiError(primaryErr);
-        if (classified.category === 'cancelled' || (classified.category === 'permanent' && !classified.isRateLimit)) {
-          throw primaryErr;
+          params.onLog?.(
+            'warn',
+            `Chunk ${params.windowLabel}: gemini-4-hydrogen diarization unavailable (${classified.message.slice(0, 120)}), switching to gemini-3.1-flash-lite.`
+          );
         }
-        params.onLog?.(
-          'warn',
-          `Chunk ${params.windowLabel}: gemini-4-hydrogen diarization unavailable (${classified.message.slice(0, 120)}), switching to gemini-3.1-flash-lite.`
-        );
-        diarizedResp = await withRetry(
-          () =>
+      }
+
+      if (!diarizedResp) {
+        diarizedResp = await executeQueuedGeminiCall({
+          model: 'gemini-3.1-flash-lite',
+          label: `diarize_lite_win_${params.windowLabel}`,
+          maxTransientAttempts: 4,
+          shouldCancel: params.shouldCancel,
+          onLog: params.onLog,
+          fn: () =>
             ai.models.generateContent({
               model: 'gemini-3.1-flash-lite',
               contents: { parts: [audioPart, { text: diarizePrompt }] },
@@ -465,14 +474,7 @@ If no Turkish speech is spoken in this clip, return [].`;
                 responseSchema: diarizeSchema,
               },
             }),
-          {
-            maxAttempts: 3,
-            baseDelayMs: 2500,
-            maxDelayMs: 65_000,
-            label: `diarize_lite_win_${params.windowLabel}`,
-            shouldCancel: params.shouldCancel,
-          }
-        );
+        });
       }
 
       const parsed = parseJsonArraySafe<Partial<AsrDiarizedLine>>(diarizedResp.text);
@@ -536,6 +538,7 @@ export class GeminiUrduTranslationAdapter implements UrduTranslationProvider {
     }>;
     movieTitle: string;
     shouldCancel?: () => boolean;
+    onLog?: (level: 'info' | 'warn' | 'error', message: string) => void;
   }): Promise<TranslationResultLine[]> {
     if (params.lines.length === 0) return [];
     const ai = getGeminiClient(120_000);
@@ -574,34 +577,44 @@ ${promptLines}`;
       'You are a senior Pakistani film dialogue writer and Turkish-to-Urdu localization director.';
 
     let response;
-    try {
-      response = await withRetry(
-        () =>
-          ai.models.generateContent({
-            model: 'gemini-4-hydrogen',
-            contents: translationPrompt,
-            config: {
-              abortSignal: AbortSignal.timeout(90_000),
-              thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-              maxOutputTokens: 8192,
-              systemInstruction: sysInst,
-              responseMimeType: 'application/json',
-              responseSchema: translationSchema,
-            },
-          }),
-        {
-          maxAttempts: 1,
+    if (isModelQuotaAvailable('gemini-4-hydrogen')) {
+      try {
+        response = await executeQueuedGeminiCall({
+          model: 'gemini-4-hydrogen',
           label: 'urdu_translation_batch',
+          maxTransientAttempts: 1,
           shouldCancel: params.shouldCancel,
+          onLog: params.onLog,
+          fn: () =>
+            ai.models.generateContent({
+              model: 'gemini-4-hydrogen',
+              contents: translationPrompt,
+              config: {
+                abortSignal: AbortSignal.timeout(90_000),
+                thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+                maxOutputTokens: 8192,
+                systemInstruction: sysInst,
+                responseMimeType: 'application/json',
+                responseSchema: translationSchema,
+              },
+            }),
+        });
+      } catch (err) {
+        const classified = classifyGeminiError(err);
+        if (classified.category === 'cancelled' || classified.category === 'permanent') {
+          throw err;
         }
-      );
-    } catch (err) {
-      const classified = classifyGeminiError(err);
-      if (classified.category === 'cancelled' || (classified.category === 'permanent' && !classified.isRateLimit)) {
-        throw err;
       }
-      response = await withRetry(
-        () =>
+    }
+
+    if (!response) {
+      response = await executeQueuedGeminiCall({
+        model: 'gemini-3.1-flash-lite',
+        label: 'urdu_translation_lite_batch',
+        maxTransientAttempts: 4,
+        shouldCancel: params.shouldCancel,
+        onLog: params.onLog,
+        fn: () =>
           ai.models.generateContent({
             model: 'gemini-3.1-flash-lite',
             contents: translationPrompt,
@@ -613,14 +626,7 @@ ${promptLines}`;
               responseSchema: translationSchema,
             },
           }),
-        {
-          maxAttempts: 3,
-          baseDelayMs: 2000,
-          maxDelayMs: 65_000,
-          label: 'urdu_translation_lite_batch',
-          shouldCancel: params.shouldCancel,
-        }
-      );
+      });
     }
 
     const parsed = parseJsonArraySafe<{ index?: number; urduText?: string }>(response.text);
@@ -640,6 +646,7 @@ export class GeminiUrduTtsAdapter implements UrduTtsProvider {
     voiceProfile: UrduVoiceProfile;
     outWavPath: string;
     shouldCancel?: () => boolean;
+    onLog?: (level: 'info' | 'warn' | 'error', message: string) => void;
   }): Promise<void> {
     const ai = getGeminiClient(120_000);
     const buildReq = (model: 'gemini-3.8-flash-lite-tts' | 'gemini-3.8-flash-tts') =>
@@ -672,26 +679,49 @@ export class GeminiUrduTtsAdapter implements UrduTtsProvider {
       });
 
     let response;
-    try {
-      response = await withRetry(() => buildReq('gemini-3.8-flash-lite-tts'), {
-        maxAttempts: 3,
-        baseDelayMs: 2500,
-        maxDelayMs: 65_000,
-        label: `urdu_tts_${params.voiceProfile.id}`,
-        shouldCancel: params.shouldCancel,
-      });
-    } catch (err) {
-      const classified = classifyGeminiError(err);
-      if (classified.category === 'cancelled' || (classified.category === 'permanent' && !classified.isRateLimit)) {
+    let lastQuotaErr: QuotaExhaustedError | null = null;
+
+    const candidateModels: Array<'gemini-3.8-flash-lite-tts' | 'gemini-3.8-flash-tts'> = [
+      'gemini-3.8-flash-lite-tts',
+      'gemini-3.8-flash-tts',
+    ];
+
+    for (const model of candidateModels) {
+      if (!isModelQuotaAvailable(model)) {
+        continue;
+      }
+      try {
+        response = await executeQueuedGeminiCall({
+          model,
+          label: `urdu_tts_${model}_${params.voiceProfile.id}`,
+          maxTransientAttempts: 4,
+          shouldCancel: params.shouldCancel,
+          onLog: params.onLog,
+          fn: () => buildReq(model),
+        });
+        break;
+      } catch (err) {
+        if (err instanceof QuotaExhaustedError) {
+          lastQuotaErr = err;
+          params.onLog?.(
+            'warn',
+            `${model} daily quota reached; checking remaining Free Tier TTS model availability.`
+          );
+          continue;
+        }
         throw err;
       }
-      response = await withRetry(() => buildReq('gemini-3.8-flash-tts'), {
-        maxAttempts: 3,
-        baseDelayMs: 2500,
-        maxDelayMs: 65_000,
-        label: `urdu_tts_flash_${params.voiceProfile.id}`,
-        shouldCancel: params.shouldCancel,
-      });
+    }
+
+    if (!response) {
+      if (lastQuotaErr) {
+        throw lastQuotaErr;
+      }
+      throw new QuotaExhaustedError(
+        candidateModels.join(' / '),
+        getNextPtMidnightIso(),
+        'All configured Gemini Free Tier TTS models have reached their daily quota. Processing paused safely.'
+      );
     }
 
     const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
@@ -708,59 +738,88 @@ export class GeminiUrduTtsAdapter implements UrduTtsProvider {
 
 export async function generateTurkishDualSpeakerSampleWav(outWavPath: string): Promise<void> {
   const ai = getGeminiClient(120_000);
-  const response = await withRetry(
-    () =>
-      ai.models.generateContent({
-        model: 'gemini-3.8-flash-tts',
-        contents: [
-          {
-            role: 'user',
-            parts: [
+  const candidateModels = ['gemini-3.8-flash-lite-tts', 'gemini-3.8-flash-tts'];
+  const buildReq = (model: string) =>
+    ai.models.generateContent({
+      model,
+      contents: [
+        {
+          role: 'user',
+          parts: [
+            {
+              text: 'Mehmet: Elif, İstanbul treni birazdan kalkacak, çabuk olmalıyız.',
+              speechMetadata: {
+                speaker: 'Mehmet',
+                style: 'Urgent, warm Turkish male cinema lead',
+              },
+            },
+            {
+              text: 'Elif: Hazırım Mehmet, babamın mektubunu yanıma aldım. Hadi gidelim!',
+              speechMetadata: {
+                speaker: 'Elif',
+                style: 'Determined, expressive Turkish female lead',
+              },
+            },
+            {
+              text: 'Mehmet: Güzel, bu gece tüm gerçeği öğreneceğiz.',
+              speechMetadata: {
+                speaker: 'Mehmet',
+                style: 'Calm, resolute tone',
+              },
+            },
+          ],
+        },
+      ],
+      config: {
+        abortSignal: AbortSignal.timeout(60_000),
+        responseModalities: ['AUDIO'],
+        speechConfig: {
+          multiSpeakerVoiceConfig: {
+            speakerVoiceConfigs: [
               {
-                text: 'Mehmet: Elif, İstanbul treni birazdan kalkacak, çabuk olmalıyız.',
-                speechMetadata: {
-                  speaker: 'Mehmet',
-                  style: 'Urgent, warm Turkish male cinema lead',
-                },
+                speaker: 'Mehmet',
+                voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Charon' } },
               },
               {
-                text: 'Elif: Hazırım Mehmet, babamın mektubunu yanıma aldım. Hadi gidelim!',
-                speechMetadata: {
-                  speaker: 'Elif',
-                  style: 'Determined, expressive Turkish female lead',
-                },
-              },
-              {
-                text: 'Mehmet: Güzel, bu gece tüm gerçeği öğreneceğiz.',
-                speechMetadata: {
-                  speaker: 'Mehmet',
-                  style: 'Calm, resolute tone',
-                },
+                speaker: 'Elif',
+                voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } },
               },
             ],
           },
-        ],
-        config: {
-          abortSignal: AbortSignal.timeout(60_000),
-          responseModalities: ['AUDIO'],
-          speechConfig: {
-            multiSpeakerVoiceConfig: {
-              speakerVoiceConfigs: [
-                {
-                  speaker: 'Mehmet',
-                  voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Charon' } },
-                },
-                {
-                  speaker: 'Elif',
-                  voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } },
-                },
-              ],
-            },
-          },
         },
-      }),
-    { maxAttempts: 3, label: 'sample_turkish_tts' }
-  );
+      },
+    });
+
+  let response: Awaited<ReturnType<typeof buildReq>> | null = null;
+  let lastQuotaErr: QuotaExhaustedError | null = null;
+
+  for (const model of candidateModels) {
+    if (!isModelQuotaAvailable(model)) continue;
+    try {
+      response = await executeQueuedGeminiCall({
+        model,
+        label: `sample_turkish_tts:${model}`,
+        maxTransientAttempts: 3,
+        fn: () => buildReq(model),
+      });
+      break;
+    } catch (err) {
+      if (err instanceof QuotaExhaustedError) {
+        lastQuotaErr = err;
+        continue;
+      }
+      throw err;
+    }
+  }
+
+  if (!response) {
+    if (lastQuotaErr) throw lastQuotaErr;
+    throw new QuotaExhaustedError(
+      candidateModels.join(' / '),
+      getNextPtMidnightIso(),
+      'All configured Gemini Free Tier TTS models have reached their daily quota.'
+    );
+  }
 
   const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
   if (!base64Audio) {
@@ -787,11 +846,12 @@ export function getProviderDiagnostics() {
       ? 'gemini-4-hydrogen (Turkish -> Pakistani Urdu)'
       : 'Not configured (GEMINI_API_KEY required)',
     ttsProvider: geminiConfigured
-      ? `${ttsProvider} (gemini-3.8-flash-lite-tts)`
+      ? `${ttsProvider} (gemini-3.8-flash-lite-tts / gemini-3.8-flash-tts)`
       : 'Not configured (GEMINI_API_KEY required)',
     sourceSeparationProvider: sourceSepUrl
       ? `External Stem Separator (${sourceSepUrl})`
       : 'FFmpeg Mid-Side Dialogue Suppression + Sidechain Ducking',
+    quota: getQuotaDiagnostics(),
   };
 }
 

@@ -6,6 +6,7 @@ import type {
   MovieProject,
   ProcessingLogEntry,
   ProcessingStageName,
+  QuotaStateStore,
   StudioUser,
   UploadSession,
 } from './types.ts';
@@ -25,11 +26,19 @@ interface StudioDatabase {
   users: Record<string, StudioUser>;
   movies: Record<string, MovieProject>;
   uploadSessions: Record<string, UploadSession>;
+  quotaState: QuotaStateStore;
+}
+
+function emptyQuotaState(): QuotaStateStore {
+  return {
+    models: {},
+    updatedAt: new Date().toISOString(),
+  };
 }
 
 function loadDatabase(): StudioDatabase {
   if (!fs.existsSync(DB_PATH)) {
-    return { users: {}, movies: {}, uploadSessions: {} };
+    return { users: {}, movies: {}, uploadSessions: {}, quotaState: emptyQuotaState() };
   }
   try {
     const raw = fs.readFileSync(DB_PATH, 'utf8');
@@ -38,9 +47,10 @@ function loadDatabase(): StudioDatabase {
       users: parsed.users ?? {},
       movies: parsed.movies ?? {},
       uploadSessions: parsed.uploadSessions ?? {},
+      quotaState: parsed.quotaState ?? emptyQuotaState(),
     };
   } catch {
-    return { users: {}, movies: {}, uploadSessions: {} };
+    return { users: {}, movies: {}, uploadSessions: {}, quotaState: emptyQuotaState() };
   }
 }
 
@@ -58,6 +68,22 @@ export function saveDatabase(): Promise<void> {
     persistSyncSafe();
   });
   return writeQueue;
+}
+
+export function getQuotaState(): QuotaStateStore {
+  if (!db.quotaState) {
+    db.quotaState = emptyQuotaState();
+  }
+  return db.quotaState;
+}
+
+export function saveQuotaState(next: QuotaStateStore): QuotaStateStore {
+  db.quotaState = {
+    ...next,
+    updatedAt: new Date().toISOString(),
+  };
+  persistSyncSafe();
+  return db.quotaState;
 }
 
 export function upsertUser(user: StudioUser): StudioUser {
@@ -154,12 +180,24 @@ export function updateMovieCharacters(
   movie.segments = movie.segments.map((seg) => {
     const char = charMap.get(seg.speakerLabel);
     if (!char) return seg;
+    const voiceChanged =
+      seg.ttsStatus === 'completed' &&
+      seg.ttsVoiceProfileId &&
+      seg.ttsVoiceProfileId !== char.voiceProfileId;
     return {
       ...seg,
       voiceProfileId: char.voiceProfileId,
       gender: char.gender,
+      ttsStatus: voiceChanged ? 'pending' : seg.ttsStatus,
+      timedWavPath: voiceChanged ? undefined : seg.timedWavPath,
     };
   });
+  const totalTts = movie.segments.length;
+  const completedTts = movie.segments.filter((s) => s.ttsStatus === 'completed').length;
+  movie.totalTtsChunks = totalTts;
+  movie.completedTtsChunks = completedTts;
+  movie.failedTtsChunks = movie.segments.filter((s) => s.ttsStatus === 'failed').length;
+  movie.remainingTtsChunks = Math.max(0, totalTts - completedTts);
   movie.updatedAt = new Date().toISOString();
   persistSyncSafe();
   return movie;

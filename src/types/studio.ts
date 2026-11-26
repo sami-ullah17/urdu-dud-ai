@@ -20,8 +20,11 @@ export type MovieStatus =
   | 'ready_for_dubbing'
   | 'queued'
   | 'processing'
+  | 'paused'
   | 'completed'
   | 'failed';
+
+export type PauseReason = 'quota_exhausted' | 'user_paused';
 
 export type CharacterGender = 'male' | 'female' | 'unknown';
 
@@ -63,6 +66,11 @@ export interface DialogueSegment {
   urduText: string;
   emotion: string;
   voiceProfileId: string;
+  ttsStatus?: 'pending' | 'processing' | 'completed' | 'failed';
+  ttsAttempts?: number;
+  ttsError?: string;
+  ttsVoiceProfileId?: string;
+  ttsCompletedAt?: string;
 }
 
 export interface ChunkState {
@@ -97,6 +105,10 @@ export interface MovieProject {
   targetLang: 'ur-PK';
   rightsConfirmed: boolean;
   status: MovieStatus;
+  targetMode?: 'scan' | 'full';
+  pauseReason?: PauseReason;
+  pausedAt?: string;
+  quotaResetAt?: string;
   currentStage: ProcessingStageName;
   stageIndex: number;
   progressPercent: number;
@@ -104,6 +116,10 @@ export interface MovieProject {
   totalChunks: number;
   completedChunks: number;
   failedChunks: number;
+  totalTtsChunks?: number;
+  completedTtsChunks?: number;
+  failedTtsChunks?: number;
+  remainingTtsChunks?: number;
   chunkStates: ChunkState[];
   characters: CharacterProfile[];
   segmentsCount: number;
@@ -125,8 +141,25 @@ export interface MovieProject {
 export interface DashboardStats {
   total: number;
   processing: number;
+  paused?: number;
   completed: number;
   failed: number;
+}
+
+export interface QuotaModelDiagnostic {
+  model: string;
+  datePt: string;
+  requestCount: number;
+  configuredOrObservedLimit: number | null;
+  exhaustedToday: boolean;
+  exhaustedUntilIso: string | null;
+}
+
+export interface QuotaDiagnostics {
+  ptDate: string;
+  nextResetIso: string;
+  allTtsExhaustedToday: boolean;
+  models: QuotaModelDiagnostic[];
 }
 
 export interface ProviderHealth {
@@ -139,6 +172,7 @@ export interface ProviderHealth {
   ffmpegAvailable: boolean;
   ffprobeAvailable: boolean;
   firebaseConfigured: boolean;
+  quota?: QuotaDiagnostics;
   limits: {
     maxUploadGb: number;
     maxUploadBytes: number;

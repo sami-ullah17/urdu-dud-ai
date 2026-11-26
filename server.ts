@@ -46,7 +46,13 @@ import {
 } from './server/providers/ffmpegPipeline.ts';
 import { hasGeminiKey, ProviderNotConfiguredError } from './server/providers/geminiClient.ts';
 import {
+  getNextPtMidnightIso,
+  getQuotaDiagnostics,
+  isModelQuotaAvailable,
+} from './server/providers/quotaManager.ts';
+import {
   cancelDubbingJob,
+  computeTtsChunkCounts,
   enqueueDubbingJob,
   resumePendingJobsOnStartup,
   type JobMode,
@@ -83,6 +89,7 @@ function sanitizeMovieForClient(movie: MovieProject, includeSegments = false) {
   const srtSig = movie.outputSrtPath
     ? signDownloadUrlToken(movie.id, movie.ownerId, 'srt')
     : null;
+  const ttsCounts = computeTtsChunkCounts(movie.segments);
 
   return {
     id: movie.id,
@@ -98,6 +105,10 @@ function sanitizeMovieForClient(movie: MovieProject, includeSegments = false) {
     targetLang: movie.targetLang,
     rightsConfirmed: movie.rightsConfirmed,
     status: movie.status,
+    targetMode: movie.targetMode,
+    pauseReason: movie.pauseReason,
+    pausedAt: movie.pausedAt,
+    quotaResetAt: movie.quotaResetAt,
     currentStage: movie.currentStage,
     stageIndex: movie.stageIndex,
     progressPercent: movie.progressPercent,
@@ -105,6 +116,10 @@ function sanitizeMovieForClient(movie: MovieProject, includeSegments = false) {
     totalChunks: movie.totalChunks,
     completedChunks: movie.completedChunks,
     failedChunks: movie.failedChunks,
+    totalTtsChunks: ttsCounts.totalTtsChunks,
+    completedTtsChunks: ttsCounts.completedTtsChunks,
+    failedTtsChunks: ttsCounts.failedTtsChunks,
+    remainingTtsChunks: ttsCounts.remainingTtsChunks,
     chunkStates: movie.chunkStates,
     characters: movie.characters,
     segmentsCount: movie.segments.length,
@@ -126,6 +141,46 @@ function sanitizeMovieForClient(movie: MovieProject, includeSegments = false) {
       ? `/api/dubbing/${movie.id}/download?type=srt&sig=${encodeURIComponent(srtSig)}`
       : null,
   };
+}
+
+function getBlockedQuotaMessage(movie: MovieProject, mode: JobMode): string | null {
+  const ttsCounts = computeTtsChunkCounts(movie.segments);
+  const effectiveTarget =
+    mode === 'scan' ? 'scan' : mode === 'full' ? 'full' : movie.targetMode ?? 'full';
+
+  const hasPendingAsr =
+    movie.chunkStates.length === 0 || movie.chunkStates.some((c) => c.status !== 'completed');
+
+  if (hasPendingAsr) {
+    const anyTextModelAvailable = ['gemini-4-hydrogen', 'gemini-3.1-flash-lite'].some((m) =>
+      isModelQuotaAvailable(m)
+    );
+    if (!anyTextModelAvailable) {
+      return (
+        `Gemini Free Tier daily quota for Turkish transcription/translation is already exhausted for today. ` +
+        `${movie.completedChunks}/${movie.totalChunks || 0} speech chunks and ` +
+        `${ttsCounts.completedTtsChunks}/${ttsCounts.totalTtsChunks} Urdu audio chunks are safely saved. ` +
+        `Click "Resume Processing" after quota resets (typically the next day) without re-uploading.`
+      );
+    }
+    return null;
+  }
+
+  if (effectiveTarget === 'full' && ttsCounts.remainingTtsChunks > 0) {
+    const anyTtsModelAvailable = ['gemini-3.8-flash-lite-tts', 'gemini-3.8-flash-tts'].some((m) =>
+      isModelQuotaAvailable(m)
+    );
+    if (!anyTtsModelAvailable) {
+      return (
+        `Gemini TTS Free Tier daily quota is already exhausted for today. ` +
+        `${ttsCounts.completedTtsChunks}/${ttsCounts.totalTtsChunks} Urdu audio chunks are saved ` +
+        `(${ttsCounts.remainingTtsChunks} remaining). Click "Resume Processing" after quota resets ` +
+        `(typically the next day) without re-uploading. Completion depends on Google's daily quotas, which may change.`
+      );
+    }
+  }
+
+  return null;
 }
 
 function isFirebaseConfigPresent(): boolean {
@@ -647,6 +702,7 @@ async function startServer() {
       processing: movies.filter(
         (m) => m.status === 'processing' || m.status === 'queued' || m.status === 'scanning'
       ).length,
+      paused: movies.filter((m) => m.status === 'paused').length,
       completed: movies.filter((m) => m.status === 'completed').length,
       failed: movies.filter((m) => m.status === 'failed').length,
     };
@@ -688,6 +744,18 @@ async function startServer() {
       return;
     }
 
+    if (!demoMode) {
+      const blockedMsg = getBlockedQuotaMessage(movie, mode);
+      if (blockedMsg) {
+        res.status(429).json({
+          code: 'QUOTA_EXHAUSTED_TODAY',
+          quotaResetAt: movie.quotaResetAt ?? getNextPtMidnightIso(),
+          error: blockedMsg,
+        });
+        return;
+      }
+    }
+
     // Encourage short-clip workflow verification before running 3-hour films (configurable override supported)
     const user = getUser(req.user!.uid);
     const isLongMovie = movie.durationSeconds > SHORT_CLIP_TEST_MINUTES * 60;
@@ -705,7 +773,50 @@ async function startServer() {
     res.json({ movie: sanitizeMovieForClient(updated, true) });
   });
 
-  // Cancel active or queued dubbing job while preserving completed chunks
+  // Resume paused or partially completed dubbing job without re-uploading or regenerating completed chunks
+  app.post('/api/dubbing/:id/resume', requireAuth, (req: AuthenticatedRequest, res: Response) => {
+    const movie = getMovie(req.params.id);
+    if (!movie || movie.ownerId !== req.user!.uid) {
+      res.status(404).json({ error: 'Movie project not found.' });
+      return;
+    }
+
+    if (
+      movie.status === 'processing' ||
+      movie.status === 'queued' ||
+      movie.status === 'scanning'
+    ) {
+      res.status(409).json({ error: 'This movie job is already active in the queue.' });
+      return;
+    }
+
+    if (!movie.demoMode && !hasGeminiKey()) {
+      res.status(503).json({
+        code: 'PROVIDER_NOT_CONFIGURED',
+        error:
+          'GEMINI_API_KEY is not configured on the server. Add GEMINI_API_KEY in Settings > Secrets before resuming.',
+      });
+      return;
+    }
+
+    if (!movie.demoMode) {
+      const blockedMsg = getBlockedQuotaMessage(movie, 'resume_chunks');
+      if (blockedMsg) {
+        res.status(429).json({
+          code: 'QUOTA_EXHAUSTED_TODAY',
+          quotaResetAt: movie.quotaResetAt ?? getNextPtMidnightIso(),
+          error: blockedMsg,
+        });
+        return;
+      }
+    }
+
+    enqueueDubbingJob(movie.id, 'resume_chunks', movie.demoMode);
+    const updated = getMovie(movie.id)!;
+    res.json({ movie: sanitizeMovieForClient(updated, true) });
+  });
+
+  // Pause / cancel active or queued dubbing job while preserving completed chunks
   app.post('/api/dubbing/:id/cancel', requireAuth, (req: AuthenticatedRequest, res: Response) => {
     const movie = getMovie(req.params.id);
     if (!movie || movie.ownerId !== req.user!.uid) {
@@ -723,9 +834,14 @@ async function startServer() {
       res.status(404).json({ error: 'Dubbing job not found.' });
       return;
     }
+    const ttsCounts = computeTtsChunkCounts(movie.segments);
     res.json({
       id: movie.id,
       status: movie.status,
+      targetMode: movie.targetMode,
+      pauseReason: movie.pauseReason,
+      pausedAt: movie.pausedAt,
+      quotaResetAt: movie.quotaResetAt,
       currentStage: movie.currentStage,
       stageIndex: movie.stageIndex,
       progressPercent: movie.progressPercent,
@@ -733,6 +849,10 @@ async function startServer() {
       totalChunks: movie.totalChunks,
       completedChunks: movie.completedChunks,
       failedChunks: movie.failedChunks,
+      totalTtsChunks: ttsCounts.totalTtsChunks,
+      completedTtsChunks: ttsCounts.completedTtsChunks,
+      failedTtsChunks: ttsCounts.failedTtsChunks,
+      remainingTtsChunks: ttsCounts.remainingTtsChunks,
       chunkStates: movie.chunkStates,
       logs: movie.logs.slice(-120),
       demoMode: movie.demoMode,
@@ -740,6 +860,7 @@ async function startServer() {
       sourceSeparationMethod: movie.sourceSeparationMethod,
       processingStartedAt: movie.processingStartedAt,
       processingCompletedAt: movie.processingCompletedAt,
+      quota: getQuotaDiagnostics(),
     });
   });
 

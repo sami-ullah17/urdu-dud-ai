@@ -51,6 +51,7 @@ service cloud.firestore {
         'fileSizeBytes', 'durationSeconds', 'sourceLang', 'targetLang',
         'rightsConfirmed', 'status', 'currentStage', 'stageIndex',
         'progressPercent', 'totalChunks', 'completedChunks', 'failedChunks',
+        'totalTtsChunks', 'completedTtsChunks', 'remainingTtsChunks', 'pauseReason',
         'demoMode', 'createdAt', 'updatedAt'
       ])
       && isValidId(data.id)
@@ -64,13 +65,17 @@ service cloud.firestore {
       && data.sourceLang == 'tr'
       && data.targetLang == 'ur-PK'
       && data.rightsConfirmed == true
-      && data.status in ['uploaded', 'queued', 'scanning', 'ready_for_dubbing', 'processing', 'completed', 'failed']
+      && data.status in ['uploaded', 'queued', 'scanning', 'ready_for_dubbing', 'processing', 'paused', 'completed', 'failed']
       && data.currentStage is string && data.currentStage.size() <= 120
       && data.stageIndex is number && data.stageIndex >= 0 && data.stageIndex <= 10
       && data.progressPercent is number && data.progressPercent >= 0 && data.progressPercent <= 100
       && (!('totalChunks' in data) || (data.totalChunks is number && data.totalChunks >= 0 && data.totalChunks <= 500))
       && (!('completedChunks' in data) || (data.completedChunks is number && data.completedChunks >= 0 && data.completedChunks <= 500))
       && (!('failedChunks' in data) || (data.failedChunks is number && data.failedChunks >= 0 && data.failedChunks <= 500))
+      && (!('totalTtsChunks' in data) || (data.totalTtsChunks is number && data.totalTtsChunks >= 0 && data.totalTtsChunks <= 20000))
+      && (!('completedTtsChunks' in data) || (data.completedTtsChunks is number && data.completedTtsChunks >= 0 && data.completedTtsChunks <= 20000))
+      && (!('remainingTtsChunks' in data) || (data.remainingTtsChunks is number && data.remainingTtsChunks >= 0 && data.remainingTtsChunks <= 20000))
+      && (!('pauseReason' in data) || (data.pauseReason is string && data.pauseReason.size() <= 64))
       && (!('demoMode' in data) || data.demoMode is bool)
       && data.createdAt is timestamp
       && data.updatedAt is timestamp;
@@ -163,7 +168,9 @@ service cloud.firestore {
         && incoming().updatedAt == request.time
         && incoming().diff(existing()).affectedKeys().hasOnly([
           'title', 'status', 'currentStage', 'stageIndex', 'progressPercent',
-          'totalChunks', 'completedChunks', 'failedChunks', 'demoMode', 'updatedAt'
+          'totalChunks', 'completedChunks', 'failedChunks',
+          'totalTtsChunks', 'completedTtsChunks', 'remainingTtsChunks', 'pauseReason',
+          'demoMode', 'updatedAt'
         ]);
       allow delete: if isVerifiedUser() && isValidId(movieId) && existing().ownerId == request.auth.uid;
 

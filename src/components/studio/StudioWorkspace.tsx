@@ -76,9 +76,9 @@ export function StudioWorkspace({
 
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [statusFilter, setStatusFilter] = useState<'all' | 'processing' | 'completed' | 'failed'>(
-    'all'
-  );
+  const [statusFilter, setStatusFilter] = useState<
+    'all' | 'processing' | 'paused' | 'completed' | 'failed'
+  >('all');
   const [searchQuery, setSearchQuery] = useState('');
   const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null);
 
@@ -169,9 +169,13 @@ export function StudioWorkspace({
     if (!hasActiveJob) return;
     const timer = setInterval(async () => {
       try {
-        const listRes = await fetchMovies();
+        const [listRes, healthRes] = await Promise.all([
+          fetchMovies(),
+          fetchProviderHealth(),
+        ]);
         setMovies(listRes.movies);
         setStats(listRes.stats);
+        setHealth(healthRes);
         if (selectedMovieId) {
           const detail = await fetchMovieDetail(selectedMovieId);
           setSelectedMovieDetail(detail);
@@ -505,21 +509,26 @@ export function StudioWorkspace({
               {/* Recent Projects Table */}
               <div className="rounded-xl bg-[#0F1429] border border-white/10 overflow-hidden">
                 <div className="p-5 border-b border-white/10 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-                  <div className="flex items-center gap-1 p-1 rounded-lg bg-[#080B18] border border-white/10 self-start">
-                    {(['all', 'processing', 'completed', 'failed'] as const).map((filterKey) => (
-                      <button
-                        key={filterKey}
-                        type="button"
-                        onClick={() => setStatusFilter(filterKey)}
-                        className={`px-3 py-1.5 rounded-md text-xs font-medium capitalize transition-colors cursor-pointer ${
-                          statusFilter === filterKey
-                            ? 'bg-violet-600 text-white'
-                            : 'text-slate-400 hover:text-white'
-                        }`}
-                      >
-                        {filterKey}
-                      </button>
-                    ))}
+                  <div className="flex flex-wrap items-center gap-1 p-1 rounded-lg bg-[#080B18] border border-white/10 self-start">
+                    {(['all', 'processing', 'paused', 'completed', 'failed'] as const).map(
+                      (filterKey) => (
+                        <button
+                          key={filterKey}
+                          type="button"
+                          onClick={() => setStatusFilter(filterKey)}
+                          className={`px-3 py-1.5 rounded-md text-xs font-medium capitalize transition-colors cursor-pointer ${
+                            statusFilter === filterKey
+                              ? 'bg-violet-600 text-white'
+                              : 'text-slate-400 hover:text-white'
+                          }`}
+                        >
+                          {filterKey}
+                          {filterKey === 'paused' && (stats.paused ?? 0) > 0
+                            ? ` (${stats.paused})`
+                            : ''}
+                        </button>
+                      )
+                    )}
                   </div>
 
                   <div className="relative w-full sm:w-64">
@@ -592,17 +601,22 @@ export function StudioWorkspace({
                                     ? 'text-emerald-300'
                                     : movie.status === 'failed'
                                       ? 'text-rose-300'
-                                      : movie.status === 'processing' ||
-                                          movie.status === 'scanning' ||
-                                          movie.status === 'queued'
-                                        ? 'text-violet-300'
-                                        : 'text-slate-300'
+                                      : movie.status === 'paused'
+                                        ? 'text-amber-300'
+                                        : movie.status === 'processing' ||
+                                            movie.status === 'scanning' ||
+                                            movie.status === 'queued'
+                                          ? 'text-violet-300'
+                                          : 'text-slate-300'
                                 }`}
                               >
                                 {movie.status.replace(/_/g, ' ')}
                               </span>
-                              <span className="block text-slate-400 truncate max-w-[180px]">
+                              <span className="block text-slate-400 truncate max-w-[200px]">
                                 {movie.currentStage}
+                                {(movie.totalTtsChunks ?? 0) > 0
+                                  ? ` · ${movie.completedTtsChunks ?? 0}/${movie.totalTtsChunks} Urdu lines`
+                                  : ''}
                               </span>
                             </td>
                             <td className="py-3.5 px-4 text-right font-mono text-xs text-slate-200 tabular-nums">
@@ -622,7 +636,9 @@ export function StudioWorkspace({
                                   onClick={() => handleSelectMovie(movie, 'processing')}
                                   className="px-2.5 py-1.5 rounded-md border border-white/10 hover:bg-white/5 text-xs text-slate-200 cursor-pointer whitespace-nowrap"
                                 >
-                                  Pipeline
+                                  {movie.status === 'paused' || movie.status === 'failed'
+                                    ? 'Resume'
+                                    : 'Pipeline'}
                                 </button>
                                 {movie.status === 'completed' && (
                                   <button
