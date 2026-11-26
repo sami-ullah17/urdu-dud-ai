@@ -15,6 +15,7 @@ import {
 } from './server/auth.ts';
 import {
   UPLOADS_DIR,
+  WORK_DIR,
   createMovie,
   createUploadSession,
   deleteMovieRecord,
@@ -44,7 +45,12 @@ import {
   renderSyntheticVideoFromWav,
 } from './server/providers/ffmpegPipeline.ts';
 import { hasGeminiKey, ProviderNotConfiguredError } from './server/providers/geminiClient.ts';
-import { enqueueDubbingJob, resumePendingJobsOnStartup, type JobMode } from './server/queue.ts';
+import {
+  cancelDubbingJob,
+  enqueueDubbingJob,
+  resumePendingJobsOnStartup,
+  type JobMode,
+} from './server/queue.ts';
 
 const PORT = Number(process.env.PORT ?? 3000) || 3000;
 const MAX_UPLOAD_GB = Math.max(1, Number(process.env.MAX_UPLOAD_GB ?? 10) || 10);
@@ -699,6 +705,17 @@ async function startServer() {
     res.json({ movie: sanitizeMovieForClient(updated, true) });
   });
 
+  // Cancel active or queued dubbing job while preserving completed chunks
+  app.post('/api/dubbing/:id/cancel', requireAuth, (req: AuthenticatedRequest, res: Response) => {
+    const movie = getMovie(req.params.id);
+    if (!movie || movie.ownerId !== req.user!.uid) {
+      res.status(404).json({ error: 'Movie project not found.' });
+      return;
+    }
+    const updated = cancelDubbingJob(movie.id) ?? movie;
+    res.json({ movie: sanitizeMovieForClient(updated, true) });
+  });
+
   // Get real dubbing job status & stage progress
   app.get('/api/dubbing/:id/status', requireAuth, (req: AuthenticatedRequest, res: Response) => {
     const movie = getMovie(req.params.id);
@@ -901,6 +918,15 @@ async function startServer() {
       }
     }
 
+    const workDir = path.join(WORK_DIR, movie.id);
+    if (fs.existsSync(workDir)) {
+      try {
+        fs.rmSync(workDir, { recursive: true, force: true });
+      } catch {
+        // ignore
+      }
+    }
+
     deleteMovieRecord(movie.id);
     res.json({ deleted: true, id: movie.id });
   });
@@ -920,10 +946,13 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
+  const server = app.listen(PORT, '0.0.0.0', () => {
     console.log(`UrduDub AI server listening on http://0.0.0.0:${PORT}`);
     resumePendingJobsOnStartup();
   });
+  server.requestTimeout = 0;
+  server.headersTimeout = 120_000;
+  server.keepAliveTimeout = 65_000;
 }
 
 void startServer();

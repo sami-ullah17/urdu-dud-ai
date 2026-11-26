@@ -1,5 +1,6 @@
 import fs from 'node:fs';
-import { ThinkingLevel, Type } from '@google/genai';
+import path from 'node:path';
+import { createPartFromUri, ThinkingLevel, Type } from '@google/genai';
 import {
   URDU_VOICE_PROFILES,
   type CharacterGender,
@@ -7,7 +8,14 @@ import {
   type DialogueSegment,
   type UrduVoiceProfile,
 } from '../types.ts';
-import { getGeminiClient, hasGeminiKey, withRetry } from './geminiClient.ts';
+import {
+  classifyGeminiError,
+  getGeminiClient,
+  hasGeminiKey,
+  JobCancelledError,
+  withRetry,
+} from './geminiClient.ts';
+import { extractSingleChunkAudio } from './ffmpegPipeline.ts';
 
 export interface AsrDiarizedLine {
   startSec: number;
@@ -32,14 +40,24 @@ export interface TurkishAsrDiarizationProvider {
     chunkStartSec: number;
     chunkEndSec: number;
     knownCharacters: CharacterProfile[];
+    shouldCancel?: () => boolean;
+    onLog?: (level: 'info' | 'warn' | 'error', message: string) => void;
   }): Promise<AsrDiarizedLine[]>;
 }
 
 export interface UrduTranslationProvider {
   readonly name: string;
   translateBatch(params: {
-    lines: Array<{ index: number; speakerLabel: string; gender: CharacterGender; turkishText: string; emotion: string; durationSec: number }>;
+    lines: Array<{
+      index: number;
+      speakerLabel: string;
+      gender: CharacterGender;
+      turkishText: string;
+      emotion: string;
+      durationSec: number;
+    }>;
     movieTitle: string;
+    shouldCancel?: () => boolean;
   }): Promise<TranslationResultLine[]>;
 }
 
@@ -50,6 +68,7 @@ export interface UrduTtsProvider {
     emotion: string;
     voiceProfile: UrduVoiceProfile;
     outWavPath: string;
+    shouldCancel?: () => boolean;
   }): Promise<void>;
 }
 
@@ -62,11 +81,157 @@ export function pickVoiceProfileForSpeaker(
   const pool = URDU_VOICE_PROFILES.filter((v) => v.gender === effectiveGender);
   const unused = pool.find((v) => !usedVoiceIds.has(v.id));
   if (unused) return unused.id;
-  // Deterministic round-robin if cast exceeds preset count
   return pool[usedVoiceIds.size % pool.length].id;
 }
 
-let preferDirectMultimodalAsr = false;
+function normalizeTextForComparison(text: string): string {
+  return text
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s]/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function tokenJaccardSimilarity(a: string, b: string): number {
+  const na = normalizeTextForComparison(a);
+  const nb = normalizeTextForComparison(b);
+  if (!na || !nb) return 0;
+  if (na === nb) return 1;
+  if (na.includes(nb) || nb.includes(na)) return 0.9;
+  const setA = new Set(na.split(' '));
+  const setB = new Set(nb.split(' '));
+  let intersection = 0;
+  for (const w of setA) {
+    if (setB.has(w)) intersection += 1;
+  }
+  const union = setA.size + setB.size - intersection;
+  return union === 0 ? 0 : intersection / union;
+}
+
+export function deduplicateBoundaryLines<T extends { startSec: number; endSec: number; turkishText: string }>(
+  existing: T[],
+  incoming: T[]
+): T[] {
+  if (existing.length === 0) return [...incoming];
+  const recentTail = existing.slice(-6);
+  const lastPrevEnd = existing[existing.length - 1].endSec;
+  const accepted: T[] = [];
+
+  for (const line of incoming) {
+    // Check if an existing tail line near the overlap boundary matches or was cut mid-sentence
+    let isDuplicate = false;
+    for (const prev of recentTail) {
+      const timeDiff = Math.abs(line.startSec - prev.startSec);
+      const overlapsInTime = line.startSec < prev.endSec - 0.25 && line.endSec > prev.startSec + 0.25;
+      const sim = tokenJaccardSimilarity(line.turkishText, prev.turkishText);
+
+      if ((overlapsInTime || timeDiff <= 2.5) && sim >= 0.65) {
+        // If previous line ended right on chunk boundary and incoming has longer complete sentence, extend prev instead of duplicating
+        if (
+          line.endSec > prev.endSec + 1.0 &&
+          line.turkishText.length > prev.turkishText.length + 8
+        ) {
+          prev.endSec = line.endSec;
+          prev.turkishText = line.turkishText;
+        }
+        isDuplicate = true;
+        break;
+      }
+    }
+
+    if (isDuplicate) continue;
+
+    // Also skip lines strictly before the previous chunk's last completed end unless genuinely distinct later speech
+    if (line.startSec < lastPrevEnd - 0.6 && line.endSec <= lastPrevEnd + 0.3) {
+      continue;
+    }
+
+    accepted.push(line);
+  }
+
+  return accepted;
+}
+
+function parseJsonArraySafe<T>(rawText: string | undefined): T[] {
+  let text = (rawText ?? '').trim();
+  if (!text) return [];
+  // Strip optional markdown code fences
+  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fenced?.[1]) {
+    text = fenced[1].trim();
+  }
+  const startIdx = text.indexOf('[');
+  const endIdx = text.lastIndexOf(']');
+  if (startIdx >= 0 && endIdx > startIdx) {
+    text = text.slice(startIdx, endIdx + 1);
+  }
+  const parsed = JSON.parse(text);
+  return Array.isArray(parsed) ? (parsed as T[]) : [];
+}
+
+const INLINE_MAX_BYTES = 4 * 1024 * 1024; // 4 MB; larger audio chunks use Gemini Files API
+
+async function prepareAudioPart(
+  ai: ReturnType<typeof getGeminiClient>,
+  audioPath: string
+): Promise<{ part: Record<string, unknown>; cleanup: () => Promise<void> }> {
+  const stat = fs.statSync(audioPath);
+  if (stat.size <= INLINE_MAX_BYTES) {
+    const audioBase64 = fs.readFileSync(audioPath).toString('base64');
+    return {
+      part: {
+        inlineData: {
+          mimeType: 'audio/mp3',
+          data: audioBase64,
+        },
+      },
+      cleanup: async () => {},
+    };
+  }
+
+  const uploaded = await ai.files.upload({
+    file: audioPath,
+    config: { mimeType: 'audio/mp3' },
+  });
+
+  // Poll until file state is ACTIVE (if processing)
+  let fileName = uploaded.name;
+  let fileUri = uploaded.uri;
+  let mimeType = uploaded.mimeType ?? 'audio/mp3';
+  if (fileName && uploaded.state === 'PROCESSING') {
+    for (let i = 0; i < 20; i++) {
+      await new Promise((r) => setTimeout(r, 1000));
+      const check = await ai.files.get({ name: fileName });
+      if (check.state === 'ACTIVE') {
+        fileUri = check.uri;
+        mimeType = check.mimeType ?? mimeType;
+        break;
+      }
+      if (check.state === 'FAILED') {
+        throw new Error('Gemini Files API failed while preparing audio chunk.');
+      }
+    }
+  }
+
+  if (!fileUri) {
+    throw new Error('Gemini Files API did not return a valid URI for audio chunk.');
+  }
+
+  return {
+    part: createPartFromUri(fileUri, mimeType) as unknown as Record<string, unknown>,
+    cleanup: async () => {
+      if (fileName) {
+        try {
+          await ai.files.delete({ name: fileName });
+        } catch {
+          // Non-fatal cleanup
+        }
+      }
+    },
+  };
+}
+
+let transcribeCooldownUntil = 0;
 
 export class GeminiTurkishAsrDiarizationAdapter implements TurkishAsrDiarizationProvider {
   readonly name = 'gemini-3.5-transcribe + gemini-4-hydrogen';
@@ -77,153 +242,283 @@ export class GeminiTurkishAsrDiarizationAdapter implements TurkishAsrDiarization
     chunkStartSec: number;
     chunkEndSec: number;
     knownCharacters: CharacterProfile[];
+    shouldCancel?: () => boolean;
+    onLog?: (level: 'info' | 'warn' | 'error', message: string) => void;
   }): Promise<AsrDiarizedLine[]> {
-    const ai = getGeminiClient();
-    const audioBytes = fs.readFileSync(params.chunkAudioPath);
-    const audioBase64 = audioBytes.toString('base64');
-
-    const audioPart = {
-      inlineData: {
-        mimeType: 'audio/mp3',
-        data: audioBase64,
-      },
-    };
-
-    // Step A: Try dedicated Turkish transcription (12s abort timeout); if endpoint hits 504/timeout,
-    // use gemini-4-hydrogen directly on audio for remaining chunks without losing 12s per chunk.
-    let rawTranscript = '';
-    if (!preferDirectMultimodalAsr) {
-      try {
-        const transcriptResp = await withRetry(
-          () =>
-            ai.models.generateContent({
-              model: 'gemini-3.5-transcribe',
-              contents: {
-                parts: [
-                  audioPart,
-                  {
-                    text: 'Transcribe all spoken Turkish dialogue in this film audio segment accurately in Turkish.',
-                  },
-                ],
-              },
-              config: {
-                abortSignal: AbortSignal.timeout(12000),
-              },
-            }),
-          { maxAttempts: 1, label: `transcribe_chunk_${params.chunkIndex}` }
-        );
-        rawTranscript = (transcriptResp.text ?? '').trim();
-      } catch {
-        preferDirectMultimodalAsr = true;
-      }
+    if (params.shouldCancel?.()) {
+      throw new JobCancelledError();
     }
 
-    const rosterContext =
-      params.knownCharacters.length > 0
-        ? params.knownCharacters
-            .map(
-              (c) =>
-                `- ${c.speakerLabel} (${c.characterName}, gender=${c.gender}, sample="${c.sampleTurkish.slice(0, 80)}")`
-            )
-            .join('\n')
-        : 'None detected yet — start numbering from Speaker 1, Speaker 2, etc.';
+    if (!fs.existsSync(params.chunkAudioPath)) {
+      throw new Error(`Audio chunk file missing on disk: ${params.chunkAudioPath}`);
+    }
 
     const chunkDuration = Math.max(1, params.chunkEndSec - params.chunkStartSec);
 
-    const transcriptSection = rawTranscript
-      ? `Reference Turkish transcript:\n"""\n${rawTranscript}\n"""\n`
-      : 'Listen directly to the attached Turkish audio and transcribe every spoken Turkish line accurately.\n';
+    // Sub-window safeguard: if an existing/legacy chunk exceeds 135 seconds (e.g. 300s Chunk 2),
+    // split it internally into <= 90s sub-windows with 6s overlap so each Gemini call stays fast & reliable.
+    if (chunkDuration > 135) {
+      const subWindowSec = 90;
+      const subOverlapSec = 6;
+      const subDir = path.join(path.dirname(params.chunkAudioPath), `sub_${params.chunkIndex}`);
+      fs.mkdirSync(subDir, { recursive: true });
 
-    // Step B: Structured timestamping + speaker diarization + gender confidence
-    // Uses gemini-4-hydrogen with resilient fallback to gemini-3.1-flash-lite on 503 demand spikes
-    const diarizePrompt = `Analyze this ${chunkDuration.toFixed(1)}s Turkish movie audio chunk (starting at ${params.chunkStartSec.toFixed(1)}s in the movie).
+      const mergedLines: AsrDiarizedLine[] = [];
+      let subCursor = 0;
+      let subIdx = 0;
+
+      try {
+        while (subCursor < chunkDuration) {
+          if (params.shouldCancel?.()) {
+            throw new JobCancelledError();
+          }
+          const relStart = Math.max(0, subCursor - (subIdx > 0 ? subOverlapSec : 0));
+          const relEnd = Math.min(chunkDuration, subCursor + subWindowSec);
+          const subPath = path.join(subDir, `sub_${subIdx}.mp3`);
+
+          await extractSingleChunkAudio(params.chunkAudioPath, relStart, relEnd, subPath);
+          const subLines = await this.processSingleWindow({
+            windowAudioPath: subPath,
+            windowLabel: `${params.chunkIndex + 1}.${subIdx + 1}`,
+            windowStartSec: params.chunkStartSec + relStart,
+            windowDurationSec: relEnd - relStart,
+            knownCharacters: params.knownCharacters,
+            shouldCancel: params.shouldCancel,
+            onLog: params.onLog,
+          });
+
+          const fresh = deduplicateBoundaryLines(mergedLines, subLines);
+          mergedLines.push(...fresh);
+
+          if (relEnd >= chunkDuration) break;
+          subCursor += subWindowSec;
+          subIdx += 1;
+        }
+        return mergedLines;
+      } finally {
+        try {
+          fs.rmSync(subDir, { recursive: true, force: true });
+        } catch {
+          // ignore cleanup failure
+        }
+      }
+    }
+
+    return this.processSingleWindow({
+      windowAudioPath: params.chunkAudioPath,
+      windowLabel: `${params.chunkIndex + 1}`,
+      windowStartSec: params.chunkStartSec,
+      windowDurationSec: chunkDuration,
+      knownCharacters: params.knownCharacters,
+      shouldCancel: params.shouldCancel,
+      onLog: params.onLog,
+    });
+  }
+
+  private async processSingleWindow(params: {
+    windowAudioPath: string;
+    windowLabel: string;
+    windowStartSec: number;
+    windowDurationSec: number;
+    knownCharacters: CharacterProfile[];
+    shouldCancel?: () => boolean;
+    onLog?: (level: 'info' | 'warn' | 'error', message: string) => void;
+  }): Promise<AsrDiarizedLine[]> {
+    const ai = getGeminiClient(180_000);
+    const { part: audioPart, cleanup } = await prepareAudioPart(ai, params.windowAudioPath);
+
+    try {
+      // Step A: Dedicated Turkish ASR using gemini-3.5-transcribe with 45s timeout (single fast attempt)
+      let rawTranscript = '';
+      if (Date.now() >= transcribeCooldownUntil) {
+        try {
+          const transcriptResp = await withRetry(
+            () =>
+              ai.models.generateContent({
+                model: 'gemini-3.5-transcribe',
+                contents: {
+                  parts: [
+                    audioPart,
+                    {
+                      text: 'Transcribe all spoken Turkish (Türkçe) dialogue in this movie audio clip verbatim in Turkish. Skip pure music and silence.',
+                    },
+                  ],
+                },
+                config: {
+                  abortSignal: AbortSignal.timeout(45_000),
+                },
+              }),
+            {
+              maxAttempts: 1,
+              label: `transcribe_win_${params.windowLabel}`,
+              shouldCancel: params.shouldCancel,
+            }
+          );
+          rawTranscript = (transcriptResp.text ?? '').trim();
+        } catch (asrErr) {
+          const classified = classifyGeminiError(asrErr);
+          if (
+            classified.category === 'cancelled' ||
+            (classified.category === 'permanent' && !classified.isRateLimit)
+          ) {
+            throw asrErr;
+          }
+          if (classified.isRateLimit && classified.category === 'permanent') {
+            // Daily RPD quota hit on gemini-3.5-transcribe; use direct multimodal ASR for 1h without extra wasted 429s
+            transcribeCooldownUntil = Date.now() + 60 * 60 * 1000;
+          }
+          params.onLog?.(
+            'warn',
+            `Chunk ${params.windowLabel}: primary ASR (${classified.message.slice(0, 120)}), using direct multimodal audio transcription.`
+          );
+        }
+      }
+
+      if (params.shouldCancel?.()) {
+        throw new JobCancelledError();
+      }
+
+      const rosterContext =
+        params.knownCharacters.length > 0
+          ? params.knownCharacters
+              .map(
+                (c) =>
+                  `- ${c.speakerLabel} (${c.characterName}, gender=${c.gender}, sample="${c.sampleTurkish.slice(0, 80)}")`
+              )
+              .join('\n')
+          : 'None detected yet — start numbering from Speaker 1, Speaker 2, etc.';
+
+      const transcriptSection = rawTranscript
+        ? `Reference Turkish transcript:\n"""\n${rawTranscript}\n"""\n`
+        : 'Listen directly to the attached Turkish audio and transcribe ONLY genuinely audible spoken Turkish dialogue sentences. If there is no clear spoken human Turkish speech (silence, ambient tone, SFX, or music only), return an empty JSON array []. NEVER invent or guess dialogue.\n';
+
+      const diarizePrompt = `Analyze this ${params.windowDurationSec.toFixed(1)}s Turkish (Türkçe) movie audio clip (timestamps strictly from 0.0 to ${params.windowDurationSec.toFixed(1)} seconds).
 ${transcriptSection}
 Known recurring speaker roster from earlier scenes (reuse the exact speakerLabel whenever the same voice returns):
 ${rosterContext}
 
-Return every spoken dialogue line with:
-- startSec and endSec relative to THIS chunk's start (0.0 to ${chunkDuration.toFixed(1)}).
+Return every genuinely spoken dialogue line as a JSON array with:
+- startSec and endSec relative to THIS clip's start (strictly 0.0 to ${params.windowDurationSec.toFixed(1)}).
 - speakerLabel: consistent identifier like "Speaker 1", "Speaker 2", etc.
 - gender: "male", "female", or "unknown" (use "unknown" if unclear, child/ambiguous, or low confidence).
 - genderConfidence: 0.0 to 1.0.
-- turkishText: clean Turkish dialogue sentence.
+- turkishText: complete, accurate Turkish dialogue sentence (do not cut sentences mid-word).
 - emotion: short tone label (e.g., "calm", "tense", "angry", "warm", "sad", "whispered").
-Skip pure music/silence segments.`;
+If no Turkish speech is spoken in this clip, return [].`;
 
-    const diarizeSchema = {
-      type: Type.ARRAY,
-      items: {
-        type: Type.OBJECT,
-        properties: {
-          startSec: { type: Type.NUMBER },
-          endSec: { type: Type.NUMBER },
-          speakerLabel: { type: Type.STRING },
-          gender: { type: Type.STRING },
-          genderConfidence: { type: Type.NUMBER },
-          turkishText: { type: Type.STRING },
-          emotion: { type: Type.STRING },
+      const diarizeSchema = {
+        type: Type.ARRAY,
+        items: {
+          type: Type.OBJECT,
+          properties: {
+            startSec: { type: Type.NUMBER },
+            endSec: { type: Type.NUMBER },
+            speakerLabel: { type: Type.STRING },
+            gender: { type: Type.STRING },
+            genderConfidence: { type: Type.NUMBER },
+            turkishText: { type: Type.STRING },
+            emotion: { type: Type.STRING },
+          },
         },
-      },
-    };
+      };
 
-    let diarizedResp;
-    try {
-      diarizedResp = await withRetry(
-        () =>
-          ai.models.generateContent({
-            model: 'gemini-4-hydrogen',
-            contents: { parts: [audioPart, { text: diarizePrompt }] },
-            config: {
-              abortSignal: AbortSignal.timeout(22000),
-              thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-              responseMimeType: 'application/json',
-              responseSchema: diarizeSchema,
-            },
-          }),
-        { maxAttempts: 1, label: `diarize_chunk_${params.chunkIndex}` }
-      );
-    } catch {
-      diarizedResp = await withRetry(
-        () =>
-          ai.models.generateContent({
-            model: 'gemini-3.1-flash-lite',
-            contents: { parts: [audioPart, { text: diarizePrompt }] },
-            config: {
-              abortSignal: AbortSignal.timeout(25000),
-              responseMimeType: 'application/json',
-              responseSchema: diarizeSchema,
-            },
-          }),
-        { maxAttempts: 2, label: `diarize_lite_chunk_${params.chunkIndex}` }
-      );
-    }
-
-    const parsed = JSON.parse((diarizedResp.text ?? '[]').trim()) as Array<
-      Partial<AsrDiarizedLine>
-    >;
-
-    return parsed
-      .filter((item) => item.turkishText && item.turkishText.trim().length > 0)
-      .map((item) => {
-        const relStart = Math.max(0, Math.min(chunkDuration - 0.3, Number(item.startSec ?? 0)));
-        const relEnd = Math.max(
-          relStart + 0.5,
-          Math.min(chunkDuration, Number(item.endSec ?? relStart + 2.5))
+      // Step B: Structured timestamping + speaker diarization + gender identification (120s timeout)
+      let diarizedResp;
+      try {
+        diarizedResp = await withRetry(
+          () =>
+            ai.models.generateContent({
+              model: 'gemini-4-hydrogen',
+              contents: { parts: [audioPart, { text: diarizePrompt }] },
+              config: {
+                abortSignal: AbortSignal.timeout(120_000),
+                thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+                maxOutputTokens: 8192,
+                responseMimeType: 'application/json',
+                responseSchema: diarizeSchema,
+              },
+            }),
+          {
+            maxAttempts: 1,
+            label: `diarize_win_${params.windowLabel}`,
+            shouldCancel: params.shouldCancel,
+          }
         );
-        const normGender: CharacterGender =
-          item.gender === 'male' || item.gender === 'female' ? item.gender : 'unknown';
-        const conf = Math.min(1, Math.max(0, Number(item.genderConfidence ?? 0.6)));
+      } catch (primaryErr) {
+        const classified = classifyGeminiError(primaryErr);
+        if (classified.category === 'cancelled' || (classified.category === 'permanent' && !classified.isRateLimit)) {
+          throw primaryErr;
+        }
+        params.onLog?.(
+          'warn',
+          `Chunk ${params.windowLabel}: gemini-4-hydrogen diarization unavailable (${classified.message.slice(0, 120)}), switching to gemini-3.1-flash-lite.`
+        );
+        diarizedResp = await withRetry(
+          () =>
+            ai.models.generateContent({
+              model: 'gemini-3.1-flash-lite',
+              contents: { parts: [audioPart, { text: diarizePrompt }] },
+              config: {
+                abortSignal: AbortSignal.timeout(120_000),
+                maxOutputTokens: 8192,
+                responseMimeType: 'application/json',
+                responseSchema: diarizeSchema,
+              },
+            }),
+          {
+            maxAttempts: 3,
+            baseDelayMs: 2500,
+            maxDelayMs: 65_000,
+            label: `diarize_lite_win_${params.windowLabel}`,
+            shouldCancel: params.shouldCancel,
+          }
+        );
+      }
 
-        return {
-          startSec: Number((params.chunkStartSec + relStart).toFixed(2)),
-          endSec: Number((params.chunkStartSec + relEnd).toFixed(2)),
-          speakerLabel: (item.speakerLabel || 'Speaker 1').trim(),
-          gender: conf >= 0.55 ? normGender : 'unknown',
-          genderConfidence: conf,
-          turkishText: item.turkishText!.trim(),
-          emotion: (item.emotion || 'natural').trim(),
-        };
-      });
+      const parsed = parseJsonArraySafe<Partial<AsrDiarizedLine>>(diarizedResp.text);
+
+      return parsed
+        .filter((item) => item.turkishText && item.turkishText.trim().length > 1)
+        .map((item) => {
+          let rawStart = Number(item.startSec ?? 0);
+          let rawEnd = Number(item.endSec ?? rawStart + 2.5);
+          // Safety guard if a model ever returns movie-absolute timestamps instead of clip-relative timestamps
+          if (
+            params.windowStartSec > 0 &&
+            rawStart > params.windowDurationSec &&
+            rawStart >= params.windowStartSec &&
+            rawStart <= params.windowStartSec + params.windowDurationSec
+          ) {
+            rawStart -= params.windowStartSec;
+            rawEnd -= params.windowStartSec;
+          }
+
+          const relStart = Math.max(
+            0,
+            Math.min(params.windowDurationSec - 0.3, rawStart)
+          );
+          const relEnd = Math.max(
+            relStart + 0.5,
+            Math.min(params.windowDurationSec, rawEnd)
+          );
+          const normGender: CharacterGender =
+            item.gender === 'male' || item.gender === 'female' ? item.gender : 'unknown';
+          const conf = Math.min(1, Math.max(0, Number(item.genderConfidence ?? 0.6)));
+
+          return {
+            startSec: Number((params.windowStartSec + relStart).toFixed(2)),
+            endSec: Number((params.windowStartSec + relEnd).toFixed(2)),
+            speakerLabel: (item.speakerLabel || 'Speaker 1').trim(),
+            gender: conf >= 0.55 ? normGender : 'unknown',
+            genderConfidence: conf,
+            turkishText: item.turkishText!.trim(),
+            emotion: (item.emotion || 'natural').trim(),
+          };
+        })
+        .sort((a, b) => a.startSec - b.startSec);
+    } finally {
+      await cleanup();
+    }
   }
 }
 
@@ -240,9 +535,10 @@ export class GeminiUrduTranslationAdapter implements UrduTranslationProvider {
       durationSec: number;
     }>;
     movieTitle: string;
+    shouldCancel?: () => boolean;
   }): Promise<TranslationResultLine[]> {
     if (params.lines.length === 0) return [];
-    const ai = getGeminiClient();
+    const ai = getGeminiClient(120_000);
 
     const promptLines = params.lines
       .map(
@@ -285,36 +581,49 @@ ${promptLines}`;
             model: 'gemini-4-hydrogen',
             contents: translationPrompt,
             config: {
-              abortSignal: AbortSignal.timeout(22000),
+              abortSignal: AbortSignal.timeout(90_000),
               thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+              maxOutputTokens: 8192,
               systemInstruction: sysInst,
               responseMimeType: 'application/json',
               responseSchema: translationSchema,
             },
           }),
-        { maxAttempts: 1, label: 'urdu_translation_batch' }
+        {
+          maxAttempts: 1,
+          label: 'urdu_translation_batch',
+          shouldCancel: params.shouldCancel,
+        }
       );
-    } catch {
+    } catch (err) {
+      const classified = classifyGeminiError(err);
+      if (classified.category === 'cancelled' || (classified.category === 'permanent' && !classified.isRateLimit)) {
+        throw err;
+      }
       response = await withRetry(
         () =>
           ai.models.generateContent({
             model: 'gemini-3.1-flash-lite',
             contents: translationPrompt,
             config: {
-              abortSignal: AbortSignal.timeout(25000),
+              abortSignal: AbortSignal.timeout(90_000),
+              maxOutputTokens: 8192,
               systemInstruction: sysInst,
               responseMimeType: 'application/json',
               responseSchema: translationSchema,
             },
           }),
-        { maxAttempts: 2, label: 'urdu_translation_lite_batch' }
+        {
+          maxAttempts: 3,
+          baseDelayMs: 2000,
+          maxDelayMs: 65_000,
+          label: 'urdu_translation_lite_batch',
+          shouldCancel: params.shouldCancel,
+        }
       );
     }
 
-    const parsed = JSON.parse((response.text ?? '[]').trim()) as Array<{
-      index?: number;
-      urduText?: string;
-    }>;
+    const parsed = parseJsonArraySafe<{ index?: number; urduText?: string }>(response.text);
     return parsed.map((item, i) => ({
       index: typeof item.index === 'number' ? item.index : params.lines[i]?.index ?? i,
       urduText: (item.urduText ?? '').trim(),
@@ -330,51 +639,75 @@ export class GeminiUrduTtsAdapter implements UrduTtsProvider {
     emotion: string;
     voiceProfile: UrduVoiceProfile;
     outWavPath: string;
+    shouldCancel?: () => boolean;
   }): Promise<void> {
-    const ai = getGeminiClient();
-    const response = await withRetry(
-      () =>
-        ai.models.generateContent({
-          model: 'gemini-3.8-flash-lite-tts',
-          contents: [
-            {
-              role: 'user',
-              parts: [
-                {
-                  text: params.urduText,
-                  speechMetadata: {
-                    style: `${params.voiceProfile.stylePrompt} Emotion: ${params.emotion}.`,
-                  },
+    const ai = getGeminiClient(120_000);
+    const buildReq = (model: 'gemini-3.8-flash-lite-tts' | 'gemini-3.8-flash-tts') =>
+      ai.models.generateContent({
+        model,
+        contents: [
+          {
+            role: 'user',
+            parts: [
+              {
+                text: params.urduText,
+                speechMetadata: {
+                  style: `${params.voiceProfile.stylePrompt} Emotion: ${params.emotion}.`,
                 },
-              ],
-            },
-          ],
-          config: {
-            abortSignal: AbortSignal.timeout(35000),
-            responseModalities: ['AUDIO'],
-            speechConfig: {
-              voiceConfig: {
-                prebuiltVoiceConfig: {
-                  voiceName: params.voiceProfile.geminiVoice,
-                },
+              },
+            ],
+          },
+        ],
+        config: {
+          abortSignal: AbortSignal.timeout(60_000),
+          responseModalities: ['AUDIO'],
+          speechConfig: {
+            voiceConfig: {
+              prebuiltVoiceConfig: {
+                voiceName: params.voiceProfile.geminiVoice,
               },
             },
           },
-        }),
-      { label: `urdu_tts_${params.voiceProfile.id}` }
-    );
+        },
+      });
+
+    let response;
+    try {
+      response = await withRetry(() => buildReq('gemini-3.8-flash-lite-tts'), {
+        maxAttempts: 3,
+        baseDelayMs: 2500,
+        maxDelayMs: 65_000,
+        label: `urdu_tts_${params.voiceProfile.id}`,
+        shouldCancel: params.shouldCancel,
+      });
+    } catch (err) {
+      const classified = classifyGeminiError(err);
+      if (classified.category === 'cancelled' || (classified.category === 'permanent' && !classified.isRateLimit)) {
+        throw err;
+      }
+      response = await withRetry(() => buildReq('gemini-3.8-flash-tts'), {
+        maxAttempts: 3,
+        baseDelayMs: 2500,
+        maxDelayMs: 65_000,
+        label: `urdu_tts_flash_${params.voiceProfile.id}`,
+        shouldCancel: params.shouldCancel,
+      });
+    }
 
     const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
     if (!base64Audio) {
       throw new Error('Gemini TTS returned an empty audio payload.');
     }
     const wavBuffer = Buffer.from(base64Audio, 'base64');
+    if (wavBuffer.length <= 44) {
+      throw new Error('Gemini TTS returned an invalid WAV header without audio samples.');
+    }
     fs.writeFileSync(params.outWavPath, wavBuffer);
   }
 }
 
 export async function generateTurkishDualSpeakerSampleWav(outWavPath: string): Promise<void> {
-  const ai = getGeminiClient();
+  const ai = getGeminiClient(120_000);
   const response = await withRetry(
     () =>
       ai.models.generateContent({
@@ -408,6 +741,7 @@ export async function generateTurkishDualSpeakerSampleWav(outWavPath: string): P
           },
         ],
         config: {
+          abortSignal: AbortSignal.timeout(60_000),
           responseModalities: ['AUDIO'],
           speechConfig: {
             multiSpeakerVoiceConfig: {
@@ -425,7 +759,7 @@ export async function generateTurkishDualSpeakerSampleWav(outWavPath: string): P
           },
         },
       }),
-    { label: 'sample_turkish_tts' }
+    { maxAttempts: 3, label: 'sample_turkish_tts' }
   );
 
   const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
@@ -444,7 +778,7 @@ export function getProviderDiagnostics() {
   return {
     geminiConfigured,
     asrProvider: geminiConfigured
-      ? `${sttProvider} (gemini-3.5-transcribe)`
+      ? `${sttProvider} (gemini-3.5-transcribe / gemini-4-hydrogen)`
       : 'Not configured (GEMINI_API_KEY required)',
     diarizationProvider: geminiConfigured
       ? 'gemini-4-hydrogen audio diarizer'

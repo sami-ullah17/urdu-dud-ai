@@ -24,6 +24,7 @@ interface UploadMovieViewProps {
 
 export function UploadMovieView({ health, onMovieCreated }: UploadMovieViewProps) {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const rightsBoxRef = useRef<HTMLLabelElement | null>(null);
   const abortRef = useRef<AbortController | null>(null);
 
   const [dragActive, setDragActive] = useState(false);
@@ -32,6 +33,7 @@ export function UploadMovieView({ health, onMovieCreated }: UploadMovieViewProps
   const [localDurationSec, setLocalDurationSec] = useState<number | null>(null);
   const [title, setTitle] = useState('');
   const [rightsConfirmed, setRightsConfirmed] = useState(false);
+  const [rightsHighlighted, setRightsHighlighted] = useState(false);
   const [confirmLongMovie, setConfirmLongMovie] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState<UploadProgressInfo | null>(null);
@@ -82,7 +84,9 @@ export function UploadMovieView({ health, onMovieCreated }: UploadMovieViewProps
       return;
     }
     if (!rightsConfirmed) {
+      setRightsHighlighted(true);
       setError('You must confirm ownership or explicit dubbing permission before uploading.');
+      rightsBoxRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' });
       return;
     }
     if (localDurationSec !== null && localDurationSec > maxDurationMin * 60) {
@@ -287,17 +291,48 @@ export function UploadMovieView({ health, onMovieCreated }: UploadMovieViewProps
               </div>
             </div>
 
-            <label className="flex items-start gap-3 text-xs text-slate-300 leading-relaxed cursor-pointer">
+            <label
+              ref={rightsBoxRef}
+              className={`flex items-start gap-3 text-xs leading-relaxed cursor-pointer p-3.5 rounded-lg border transition-colors ${
+                rightsHighlighted && !rightsConfirmed
+                  ? 'bg-rose-950/40 border-rose-500/60 text-rose-100 ring-1 ring-rose-500/40'
+                  : rightsConfirmed
+                    ? 'bg-emerald-950/20 border-emerald-500/30 text-slate-200'
+                    : 'bg-[#080B18] border-white/15 text-slate-200 hover:border-violet-500/40'
+              }`}
+            >
               <input
                 type="checkbox"
                 checked={rightsConfirmed}
-                onChange={(e) => setRightsConfirmed(e.target.checked)}
+                onChange={(e) => {
+                  const checked = e.target.checked;
+                  setRightsConfirmed(checked);
+                  if (checked) {
+                    setRightsHighlighted(false);
+                    if (
+                      error ===
+                      'You must confirm ownership or explicit dubbing permission before uploading.'
+                    ) {
+                      setError(null);
+                    }
+                  }
+                }}
                 disabled={uploading}
-                className="mt-0.5 rounded border-white/20 bg-[#080B18] text-violet-600 focus:ring-violet-500"
+                className="mt-0.5 h-4 w-4 rounded border-white/25 bg-[#080B18] text-violet-600 focus:ring-violet-500 shrink-0"
               />
-              <span>
-                I confirm that I own this video or hold explicit legal authorization to translate and
-                dub its dialogue into Urdu.
+              <span className="space-y-1">
+                <span className="block font-medium text-white">
+                  Required: Confirm ownership or legal dubbing permission
+                </span>
+                <span className="block text-slate-300">
+                  I confirm that I own this video or hold explicit legal authorization to translate
+                  and dub its dialogue into Urdu.
+                </span>
+                {rightsHighlighted && !rightsConfirmed && (
+                  <span className="block text-rose-300 font-medium pt-0.5">
+                    Please tick this checkbox before clicking Upload.
+                  </span>
+                )}
               </span>
             </label>
 

@@ -1,0 +1,33 @@
+{
+  "users": {
+    "studio_71c704635fa2f23a": {
+      "uid": "studio_71c704635fa2f23a",
+      "email": "pipeline-qa@urdudub.ai",
+      "displayName": "Pipeline QA",
+      "shortClipVerified": false,
+      "createdAt": "2026-11-21T12:27:44.350Z"
+    },
+    "studio_6eb7422ca7a36ea5": {
+      "uid": "studio_6eb7422ca7a36ea5",
+      "email": "qa_verify@urdudub.test",
+      "displayName": "QA Verifier",
+      "shortClipVerified": true,
+      "createdAt": "2026-11-21T12:36:17.440Z"
+    }
+  },
+  "movies": {},
+  "uploadSessions": {
+    "upl_84c99ce026114114ad8356b5de4f58e0": {
+      "uploadId": "upl_84c99ce026114114ad8356b5de4f58e0",
+      "ownerId": "studio_6eb7422ca7a36ea5",
+      "title": "QA 5-Min Turkish Movie",
+      "originalFilename": "qa_5min.mp4",
+      "format": "mp4",
+      "expectedSizeBytes": 1095605,
+      "receivedBytes": 0,
+      "rightsConfirmed": true,
+      "tempFilePath": "/app/applet/uploads/tmp/upl_84c99ce026114114ad8356b5de4f58e0.part",
+      "createdAt": "2026-11-21T12:36:17.456Z"
+    }
+  }
+}

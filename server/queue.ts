@@ -23,12 +23,20 @@ import {
   GeminiUrduTranslationAdapter,
   GeminiUrduTtsAdapter,
   buildDemoSegmentsForDuration,
+  deduplicateBoundaryLines,
   pickVoiceProfileForSpeaker,
 } from './providers/dubbingAdapters.ts';
-import { hasGeminiKey, ProviderNotConfiguredError } from './providers/geminiClient.ts';
+import {
+  classifyGeminiError,
+  hasGeminiKey,
+  JobCancelledError,
+  ProviderNotConfiguredError,
+  sleepWithCancel,
+} from './providers/geminiClient.ts';
 import {
   extractBackgroundBed,
   extractFullStereoAudio,
+  extractSingleChunkAudio,
   fitSegmentTiming,
   generateSrtSubtitles,
   mixVoiceAndBackground,
@@ -36,6 +44,7 @@ import {
   probeVideo,
   renderMixedVoiceTrack,
   splitAudioIntoChunks,
+  type ExtractedChunk,
 } from './providers/ffmpegPipeline.ts';
 
 export type JobMode = 'scan' | 'full' | 'resume_chunks';
@@ -48,16 +57,21 @@ interface QueuedJob {
 
 const activeQueue: QueuedJob[] = [];
 const runningMovies = new Set<string>();
+const cancelledMovies = new Set<string>();
 let isDraining = false;
 
-const CHUNK_DURATION_SECONDS = Math.max(
-  30,
-  Number(process.env.CHUNK_DURATION_SECONDS ?? 120) || 120
-);
-const CHUNK_OVERLAP_SECONDS = Math.max(
-  0,
-  Number(process.env.CHUNK_OVERLAP_SECONDS ?? 4) || 4
-);
+// 60-120s chunks with 5-10s overlap (defaults: 90s chunk, 6s overlap)
+const rawChunkDuration = Number(process.env.CHUNK_DURATION_SECONDS ?? 90) || 90;
+const CHUNK_DURATION_SECONDS = Math.min(120, Math.max(60, rawChunkDuration));
+
+const rawChunkOverlap = Number(process.env.CHUNK_OVERLAP_SECONDS ?? 6) || 6;
+const CHUNK_OVERLAP_SECONDS = Math.min(10, Math.max(5, rawChunkOverlap));
+
+const MAX_CHUNK_ATTEMPTS = 5;
+
+function isJobCancelled(movieId: string): boolean {
+  return cancelledMovies.has(movieId);
+}
 
 function setStage(
   movieId: string,
@@ -85,6 +99,8 @@ function cleanupWorkDir(movieWorkDir: string) {
 }
 
 export function enqueueDubbingJob(movieId: string, mode: JobMode, demoMode = false): void {
+  cancelledMovies.delete(movieId);
+
   if (runningMovies.has(movieId)) {
     return;
   }
@@ -103,9 +119,44 @@ export function enqueueDubbingJob(movieId: string, mode: JobMode, demoMode = fal
     movieId,
     'System',
     'info',
-    `Job queued (mode=${mode}${demoMode ? ', DEMO_MODE' : ''}).`
+    `Job queued in background (mode=${mode}${demoMode ? ', DEMO_MODE' : ''}). Safe to close or refresh browser.`
   );
   void drainQueue();
+}
+
+export function cancelDubbingJob(movieId: string): MovieProject | undefined {
+  cancelledMovies.add(movieId);
+
+  const qIdx = activeQueue.findIndex((j) => j.movieId === movieId);
+  if (qIdx >= 0) {
+    activeQueue.splice(qIdx, 1);
+  }
+
+  const movie = getMovie(movieId);
+  if (!movie) return undefined;
+
+  if (!runningMovies.has(movieId)) {
+    const updated = updateMovie(movieId, {
+      status: 'failed',
+      error: 'Job cancelled by user. Completed chunks are preserved — click Retry Failed Chunks to resume.',
+      etaSeconds: null,
+    });
+    appendMovieLog(
+      movieId,
+      'System',
+      'warn',
+      'Job cancelled while queued. Completed chunks preserved.'
+    );
+    return updated;
+  }
+
+  appendMovieLog(
+    movieId,
+    'System',
+    'warn',
+    'Cancellation requested; stopping after current step while preserving completed chunks.'
+  );
+  return getMovie(movieId);
 }
 
 export function resumePendingJobsOnStartup(): void {
@@ -115,9 +166,13 @@ export function resumePendingJobsOnStartup(): void {
       movie.id,
       'System',
       'warn',
-      'Server restarted while job was active; resuming persisted dubbing job.'
+      'Server restarted while job was active; resuming persisted dubbing job from last saved chunk.'
     );
-    enqueueDubbingJob(movie.id, movie.status === 'scanning' ? 'scan' : 'resume_chunks', movie.demoMode);
+    enqueueDubbingJob(
+      movie.id,
+      movie.status === 'scanning' ? 'scan' : 'resume_chunks',
+      movie.demoMode
+    );
   }
 }
 
@@ -128,19 +183,34 @@ async function drainQueue(): Promise<void> {
     while (activeQueue.length > 0) {
       const next = activeQueue.shift()!;
       if (runningMovies.has(next.movieId)) continue;
+      if (isJobCancelled(next.movieId)) {
+        cancelledMovies.delete(next.movieId);
+        continue;
+      }
       runningMovies.add(next.movieId);
       try {
         await executeDubbingJob(next.movieId, next.mode, next.demoMode);
       } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
+        const msg =
+          err instanceof JobCancelledError
+            ? 'Job cancelled by user. Completed chunks are preserved — click Retry Failed Chunks to resume.'
+            : err instanceof Error
+              ? err.message
+              : String(err);
         updateMovie(next.movieId, {
           status: 'failed',
           error: msg,
           etaSeconds: null,
         });
-        appendMovieLog(next.movieId, 'System', 'error', `Job failed: ${msg}`);
+        appendMovieLog(
+          next.movieId,
+          'System',
+          err instanceof JobCancelledError ? 'warn' : 'error',
+          err instanceof JobCancelledError ? msg : `Job failed: ${msg}`
+        );
       } finally {
         runningMovies.delete(next.movieId);
+        cancelledMovies.delete(next.movieId);
       }
     }
   } finally {
@@ -207,6 +277,10 @@ async function executeDubbingJob(
   const movie = getMovie(movieId);
   if (!movie) return;
 
+  if (isJobCancelled(movieId)) {
+    throw new JobCancelledError();
+  }
+
   if (!movie.rightsConfirmed) {
     throw new Error('Copyright permission confirmation is required before processing.');
   }
@@ -243,37 +317,107 @@ async function executeDubbingJob(
     );
   }
 
-  // Stage 2: Extracting audio
+  if (isJobCancelled(movieId)) {
+    throw new JobCancelledError();
+  }
+
+  // Stage 2: Extracting audio (reuse existing full_stereo.wav on resume!)
   setStage(movieId, 1, 8, null);
-  appendMovieLog(movieId, 'Extracting audio', 'info', 'Extracting 48kHz stereo audio track via FFmpeg.');
   const fullStereoWav = path.join(movieWorkDir, 'full_stereo.wav');
-  await extractFullStereoAudio(movie.sourceVideoPath, fullStereoWav);
+  const hasExistingWav =
+    fs.existsSync(fullStereoWav) && fs.statSync(fullStereoWav).size > 4096;
+  const hasCompletedScan =
+    mode === 'full' &&
+    movie.status === 'ready_for_dubbing' &&
+    movie.chunkStates.length > 0 &&
+    movie.chunkStates.every((c) => c.status === 'completed');
+  const preserveCompletedChunks = mode === 'resume_chunks' || hasCompletedScan;
 
-  // Stage 3: Detecting Turkish speech & splitting into manageable overlapping chunks
+  if (preserveCompletedChunks && hasExistingWav) {
+    appendMovieLog(
+      movieId,
+      'Extracting audio',
+      'info',
+      'Reusing previously extracted 48kHz stereo audio track from disk.'
+    );
+  } else {
+    appendMovieLog(
+      movieId,
+      'Extracting audio',
+      'info',
+      'Extracting 48kHz stereo audio track via FFmpeg.'
+    );
+    await extractFullStereoAudio(movie.sourceVideoPath, fullStereoWav);
+  }
+
+  if (isJobCancelled(movieId)) {
+    throw new JobCancelledError();
+  }
+
+  // Stage 3: Detecting Turkish speech & preparing overlapping chunks
   setStage(movieId, 2, 14, null);
-  const chunks = await splitAudioIntoChunks(
-    fullStereoWav,
-    chunksDir,
-    probe.durationSeconds,
-    CHUNK_DURATION_SECONDS,
-    CHUNK_OVERLAP_SECONDS
-  );
 
-  // Preserve existing chunk state when resuming failed chunks
-  const prevChunkMap = new Map(movie.chunkStates.map((c) => [c.index, c]));
-  const chunkStates: ChunkState[] = chunks.map((ch) => {
-    const prev = prevChunkMap.get(ch.index);
-    if (mode === 'resume_chunks' && prev && prev.status === 'completed') {
-      return prev;
+  let chunks: ExtractedChunk[] = [];
+  let chunkStates: ChunkState[] = [];
+
+  const canPreserveSchedule = preserveCompletedChunks && movie.chunkStates.length > 0;
+
+  if (canPreserveSchedule) {
+    // Preserve exact existing chunk boundaries and completed statuses!
+    chunkStates = movie.chunkStates.map((prev) => ({
+      ...prev,
+      status: prev.status === 'completed' ? 'completed' : 'pending',
+      error: prev.status === 'completed' ? undefined : prev.error,
+    }));
+
+    for (const st of chunkStates) {
+      const outMp3 = path.join(chunksDir, `chunk_${String(st.index).padStart(4, '0')}.mp3`);
+      if (st.status !== 'completed') {
+        const existsValid = fs.existsSync(outMp3) && fs.statSync(outMp3).size > 512;
+        if (!existsValid) {
+          await extractSingleChunkAudio(fullStereoWav, st.startSec, st.endSec, outMp3);
+        }
+      }
+      chunks.push({
+        index: st.index,
+        startSec: st.startSec,
+        endSec: st.endSec,
+        audioPath: outMp3,
+      });
     }
-    return {
+
+    const completedCount = chunkStates.filter((c) => c.status === 'completed').length;
+    appendMovieLog(
+      movieId,
+      'Detecting Turkish speech',
+      'info',
+      `Resuming persisted schedule: ${completedCount}/${chunkStates.length} chunk(s) already completed and preserved.`
+    );
+  } else {
+    chunks = await splitAudioIntoChunks(
+      fullStereoWav,
+      chunksDir,
+      probe.durationSeconds,
+      CHUNK_DURATION_SECONDS,
+      CHUNK_OVERLAP_SECONDS,
+      true
+    );
+
+    chunkStates = chunks.map((ch) => ({
       index: ch.index,
       startSec: ch.startSec,
       endSec: ch.endSec,
       status: 'pending',
-      attempts: prev?.attempts ?? 0,
-    };
-  });
+      attempts: 0,
+    }));
+
+    appendMovieLog(
+      movieId,
+      'Detecting Turkish speech',
+      'info',
+      `Split ${probe.durationSeconds.toFixed(1)}s audio into ${chunks.length} overlapping segment(s) (${CHUNK_DURATION_SECONDS}s window, ${CHUNK_OVERLAP_SECONDS}s overlap).`
+    );
+  }
 
   updateMovie(movieId, {
     totalChunks: chunks.length,
@@ -281,13 +425,6 @@ async function executeDubbingJob(
     failedChunks: chunkStates.filter((c) => c.status === 'failed').length,
     chunkStates,
   });
-
-  appendMovieLog(
-    movieId,
-    'Detecting Turkish speech',
-    'info',
-    `Split ${probe.durationSeconds.toFixed(1)}s audio into ${chunks.length} overlapping segment(s) (${CHUNK_DURATION_SECONDS}s window, ${CHUNK_OVERLAP_SECONDS}s overlap).`
-  );
 
   // Clearly labeled Demo Mode pipeline (only when user explicitly selects Demo Mode because API key is missing)
   if (demoMode) {
@@ -306,7 +443,6 @@ async function executeDubbingJob(
     }
 
     setStage(movieId, 7, 72, 3);
-    // Generate clean ambient synth tone bed + silence-matched MP4 in demo mode
     const bgBedWav = path.join(movieWorkDir, 'bg_bed.wav');
     await extractBackgroundBed(fullStereoWav, bgBedWav, probe.channels ?? 2);
     const outMp4 = path.join(OUTPUTS_DIR, `${movieId}_demo_dubbed.mp4`);
@@ -346,7 +482,7 @@ async function executeDubbingJob(
 
   const roster: CharacterProfile[] = movie.characters.map((c) => ({ ...c, lineCount: 0 }));
   const existingSegmentsByChunk = new Map<number, DialogueSegment[]>();
-  if (mode === 'resume_chunks') {
+  if (preserveCompletedChunks) {
     for (const seg of movie.segments) {
       const arr = existingSegmentsByChunk.get(seg.chunkIndex) ?? [];
       arr.push(seg);
@@ -358,11 +494,16 @@ async function executeDubbingJob(
   const chunkDurationsMs: number[] = [];
 
   for (let i = 0; i < chunks.length; i++) {
+    if (isJobCancelled(movieId)) {
+      throw new JobCancelledError();
+    }
+
     const chunk = chunks[i];
     const state = chunkStates[i];
 
-    if (mode === 'resume_chunks' && state.status === 'completed' && existingSegmentsByChunk.has(i)) {
-      const preserved = existingSegmentsByChunk.get(i)!;
+    // Preserve completed chunks even if a silent/music-only chunk had 0 dialogue segments
+    if (preserveCompletedChunks && state.status === 'completed') {
+      const preserved = existingSegmentsByChunk.get(i) ?? [];
       for (const seg of preserved) {
         const char = mergeSpeakerIntoRoster(movie, roster, seg);
         seg.voiceProfileId = char.voiceProfileId;
@@ -372,27 +513,35 @@ async function executeDubbingJob(
     }
 
     state.status = 'processing';
+    state.error = undefined;
     updateMovie(movieId, { chunkStates: [...chunkStates] });
 
     const chunkStartMs = Date.now();
     let chunkSucceeded = false;
     let lastChunkErr = '';
+    let isPermanentErr = false;
 
-    // Automatic chunk-level retry loop (up to 3 attempts)
-    for (let attempt = 1; attempt <= 3; attempt++) {
+    // Smart retry loop: up to 5 attempts with exponential backoff for transient errors
+    for (let attempt = 1; attempt <= MAX_CHUNK_ATTEMPTS; attempt++) {
+      if (isJobCancelled(movieId)) {
+        throw new JobCancelledError();
+      }
+
       state.attempts = attempt;
+      updateMovie(movieId, { chunkStates: [...chunkStates] });
+
       try {
-        // Real ETA calculated ONLY after >=1 chunk completes
+        const completedCount = chunkStates.filter((c) => c.status === 'completed').length;
         const avgChunkMs =
           chunkDurationsMs.length > 0
             ? chunkDurationsMs.reduce((a, b) => a + b, 0) / chunkDurationsMs.length
             : null;
-        const remainingChunks = chunks.length - i;
+        const remainingChunks = chunks.length - completedCount;
         const etaSec =
           avgChunkMs !== null ? Math.round((avgChunkMs * remainingChunks) / 1000) + 12 : null;
 
         // Stage 4: Transcribing dialogue + Stage 5: Identifying speakers
-        const basePct = 18 + (i / chunks.length) * 52;
+        const basePct = 18 + (completedCount / Math.max(1, chunks.length)) * 52;
         setStage(movieId, 3, basePct, etaSec);
 
         const diarizedLines = await asrAdapter.transcribeAndDiarizeChunk({
@@ -401,19 +550,17 @@ async function executeDubbingJob(
           chunkStartSec: chunk.startSec,
           chunkEndSec: chunk.endSec,
           knownCharacters: roster,
+          shouldCancel: () => isJobCancelled(movieId),
+          onLog: (level, msg) => appendMovieLog(movieId, 'Transcribing dialogue', level, msg),
         });
 
-        setStage(movieId, 4, basePct + 6 / chunks.length, etaSec);
+        setStage(movieId, 4, basePct + 14 / Math.max(1, chunks.length), etaSec);
 
         // Deduplicate lines captured inside overlap region from previous chunk
-        const lastPrevEnd =
-          allSegments.length > 0 ? allSegments[allSegments.length - 1].endSec : -1;
-        const freshLines = diarizedLines.filter(
-          (l) => i === 0 || l.startSec >= lastPrevEnd - 0.35
-        );
+        const freshLines = deduplicateBoundaryLines(allSegments, diarizedLines);
 
-        // Stage 6: Translating Turkish into Urdu (only if full mode or for sample preview)
-        setStage(movieId, 5, basePct + 14 / chunks.length, etaSec);
+        // Stage 6: Translating Turkish into Urdu
+        setStage(movieId, 5, basePct + 28 / Math.max(1, chunks.length), etaSec);
         const translations =
           freshLines.length > 0
             ? await translationAdapter.translateBatch({
@@ -426,6 +573,7 @@ async function executeDubbingJob(
                   emotion: l.emotion,
                   durationSec: Math.max(0.8, l.endSec - l.startSec),
                 })),
+                shouldCancel: () => isJobCancelled(movieId),
               })
             : [];
 
@@ -468,20 +616,40 @@ async function executeDubbingJob(
           movieId,
           'Translating Turkish into Urdu',
           'info',
-          `Chunk ${i + 1}/${chunks.length} complete (${freshLines.length} dialogue lines, ${(elapsed / 1000).toFixed(1)}s).`
+          `Chunk ${i + 1}/${chunks.length} completed (${freshLines.length} dialogue lines, ${(elapsed / 1000).toFixed(1)}s${attempt > 1 ? `, recovered on attempt ${attempt}` : ''}).`
         );
         break;
       } catch (err) {
-        lastChunkErr = err instanceof Error ? err.message : String(err);
+        const classified = classifyGeminiError(err);
+        lastChunkErr = classified.message;
+
+        if (classified.category === 'cancelled') {
+          state.status = 'failed';
+          state.error = 'Cancelled by user';
+          updateMovie(movieId, {
+            chunkStates: [...chunkStates],
+            completedChunks: chunkStates.filter((c) => c.status === 'completed').length,
+            failedChunks: chunkStates.filter((c) => c.status === 'failed').length,
+            characters: roster,
+            segments: allSegments,
+          });
+          throw err;
+        }
+
+        isPermanentErr = classified.category === 'permanent';
         appendMovieLog(
           movieId,
           'Transcribing dialogue',
-          'warn',
-          `Chunk ${i + 1}/${chunks.length} attempt ${attempt} failed: ${lastChunkErr}`
+          isPermanentErr ? 'error' : 'warn',
+          `Chunk ${i + 1}/${chunks.length} attempt ${attempt}/${MAX_CHUNK_ATTEMPTS} (${classified.category}) failed: ${lastChunkErr}`
         );
-        if (attempt < 3) {
-          await new Promise((r) => setTimeout(r, 1500 * attempt));
+
+        if (isPermanentErr || attempt === MAX_CHUNK_ATTEMPTS) {
+          break;
         }
+
+        const backoffMs = Math.min(30_000, 2000 * Math.pow(2, attempt - 1)) + Math.floor(Math.random() * 500);
+        await sleepWithCancel(backoffMs, () => isJobCancelled(movieId));
       }
     }
 
@@ -495,17 +663,26 @@ async function executeDubbingJob(
         characters: roster,
         segments: allSegments,
       });
-      throw new Error(`Chunk ${i + 1} failed after 3 attempts: ${lastChunkErr}`);
+      throw new Error(
+        isPermanentErr
+          ? `Chunk ${i + 1} failed (permanent error): ${lastChunkErr}`
+          : `Chunk ${i + 1} failed after ${MAX_CHUNK_ATTEMPTS} attempts: ${lastChunkErr}`
+      );
     }
 
+    const doneNow = chunkStates.filter((c) => c.status === 'completed').length;
+    const progressNow = 18 + (doneNow / Math.max(1, chunks.length)) * 52;
     updateMovie(movieId, {
       chunkStates: [...chunkStates],
-      completedChunks: chunkStates.filter((c) => c.status === 'completed').length,
-      failedChunks: 0,
+      completedChunks: doneNow,
+      failedChunks: chunkStates.filter((c) => c.status === 'failed').length,
+      progressPercent: Math.round(progressNow),
       characters: roster,
       segments: allSegments,
     });
   }
+
+  allSegments.sort((a, b) => a.startSec - b.startSec);
 
   // If user requested speaker discovery scan only, stop cleanly so they can customize character voices
   if (mode === 'scan') {
@@ -524,7 +701,6 @@ async function executeDubbingJob(
       'success',
       `Speaker scan complete: identified ${roster.length} character(s) across ${allSegments.length} dialogue lines. Ready for voice review.`
     );
-    cleanupWorkDir(movieWorkDir);
     return;
   }
 
@@ -551,28 +727,37 @@ async function executeDubbingJob(
 
   const ttsDurations: number[] = [];
   for (let idx = 0; idx < allSegments.length; idx++) {
+    if (isJobCancelled(movieId)) {
+      throw new JobCancelledError();
+    }
+
     const seg = allSegments[idx];
     const t0 = Date.now();
     const voiceProfile =
       URDU_VOICE_PROFILES.find((v) => v.id === seg.voiceProfileId) ?? URDU_VOICE_PROFILES[0];
 
-    const rawWav = path.join(ttsDir, `raw_${idx}.wav`);
-    const timedWav = path.join(ttsDir, `timed_${idx}.wav`);
+    const rawWav = path.join(ttsDir, `raw_${idx}_${voiceProfile.id}.wav`);
+    const timedWav = path.join(ttsDir, `timed_${idx}_${voiceProfile.id}.wav`);
 
-    await ttsAdapter.synthesizeLine({
-      urduText: seg.urduText,
-      emotion: seg.emotion,
-      voiceProfile,
-      outWavPath: rawWav,
-    });
+    const hasCachedTimed = fs.existsSync(timedWav) && fs.statSync(timedWav).size > 1024;
+    if (!hasCachedTimed) {
+      await ttsAdapter.synthesizeLine({
+        urduText: seg.urduText,
+        emotion: seg.emotion,
+        voiceProfile,
+        outWavPath: rawWav,
+        shouldCancel: () => isJobCancelled(movieId),
+      });
 
-    setStage(movieId, 7, 72 + ((idx + 1) / Math.max(1, allSegments.length)) * 16);
-    await fitSegmentTiming(
-      rawWav,
-      timedWav,
-      Math.max(0.6, seg.endSec - seg.startSec),
-      voiceProfile.pitchSemitones
-    );
+      setStage(movieId, 7, 72 + ((idx + 1) / Math.max(1, allSegments.length)) * 16);
+      await fitSegmentTiming(
+        rawWav,
+        timedWav,
+        Math.max(0.6, seg.endSec - seg.startSec),
+        voiceProfile.pitchSemitones
+      );
+    }
+
     seg.timedWavPath = timedWav;
     ttsDurations.push(Date.now() - t0);
 
@@ -584,6 +769,10 @@ async function executeDubbingJob(
         etaSeconds: eta,
       });
     }
+  }
+
+  if (isJobCancelled(movieId)) {
+    throw new JobCancelledError();
   }
 
   // Stage 9: Mixing audio (source separation / SFX preservation + sidechain ducking)

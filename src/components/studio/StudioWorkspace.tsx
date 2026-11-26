@@ -63,7 +63,13 @@ export function StudioWorkspace({
     completed: 0,
     failed: 0,
   });
-  const [selectedMovieId, setSelectedMovieId] = useState<string | null>(null);
+  const [selectedMovieId, setSelectedMovieId] = useState<string | null>(() => {
+    try {
+      return localStorage.getItem('urdudub_selected_movie_id');
+    } catch {
+      return null;
+    }
+  });
   const [selectedMovieDetail, setSelectedMovieDetail] = useState<MovieProject | null>(null);
   const [voices, setVoices] = useState<UrduVoiceProfile[]>([]);
   const [health, setHealth] = useState<ProviderHealth | null>(null);
@@ -76,6 +82,18 @@ export function StudioWorkspace({
   const [searchQuery, setSearchQuery] = useState('');
   const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null);
 
+  useEffect(() => {
+    try {
+      if (selectedMovieId) {
+        localStorage.setItem('urdudub_selected_movie_id', selectedMovieId);
+      } else {
+        localStorage.removeItem('urdudub_selected_movie_id');
+      }
+    } catch {
+      // ignore storage errors
+    }
+  }, [selectedMovieId]);
+
   const loadWorkspace = useCallback(async () => {
     try {
       const [moviesData, healthData, voicesData] = await Promise.all([
@@ -87,7 +105,10 @@ export function StudioWorkspace({
       setStats(moviesData.stats);
       setHealth(healthData);
       setVoices(voicesData);
-      setSelectedMovieId((curr) => curr ?? moviesData.movies[0]?.id ?? null);
+      setSelectedMovieId((curr) => {
+        if (curr && moviesData.movies.some((m) => m.id === curr)) return curr;
+        return moviesData.movies[0]?.id ?? null;
+      });
       setError(null);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load workspace data.');

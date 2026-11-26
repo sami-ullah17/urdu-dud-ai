@@ -9,8 +9,9 @@ import {
   Mic2,
   Play,
   RotateCcw,
+  Square,
 } from 'lucide-react';
-import { startDubbingJob } from '../../lib/api';
+import { cancelDubbingJob, startDubbingJob } from '../../lib/api';
 import { PROCESSING_STAGES, type MovieProject, type ProviderHealth } from '../../types/studio';
 
 interface ProcessingViewProps {
@@ -70,8 +71,26 @@ export function ProcessingView({
     }
   }
 
+  async function handleCancelJob() {
+    if (!movie) return;
+    setError(null);
+    setBusy(true);
+    try {
+      const updated = await cancelDubbingJob(movie.id);
+      onMovieUpdated(updated);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Unable to cancel job.');
+    } finally {
+      setBusy(false);
+    }
+  }
+
   const isActive =
     movie.status === 'processing' || movie.status === 'queued' || movie.status === 'scanning';
+  const pendingCount = movie.chunkStates.filter((c) => c.status === 'pending').length;
+  const processingCount = movie.chunkStates.filter((c) => c.status === 'processing').length;
+  const completedCount = movie.chunkStates.filter((c) => c.status === 'completed').length;
+  const failedCount = movie.chunkStates.filter((c) => c.status === 'failed').length;
 
   return (
     <div className="space-y-8">
@@ -149,12 +168,24 @@ export function ProcessingView({
             </>
           )}
 
-          {movie.status === 'failed' && (
+          {isActive && (
+            <button
+              type="button"
+              disabled={busy}
+              onClick={handleCancelJob}
+              className="inline-flex items-center gap-2 px-4 py-2 rounded-lg border border-rose-500/35 bg-rose-950/30 hover:bg-rose-900/40 text-rose-200 text-xs font-medium transition-colors whitespace-nowrap cursor-pointer disabled:opacity-50"
+            >
+              <Square className="w-3.5 h-3.5" />
+              Cancel Job
+            </button>
+          )}
+
+          {(movie.status === 'failed' || (!isActive && failedCount > 0)) && (
             <button
               type="button"
               disabled={busy}
               onClick={() => triggerJob('resume_chunks', movie.demoMode)}
-              className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-violet-600 hover:bg-violet-500 text-white text-xs font-medium transition-colors whitespace-nowrap cursor-pointer"
+              className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-violet-600 hover:bg-violet-500 text-white text-xs font-medium transition-colors whitespace-nowrap cursor-pointer disabled:opacity-50"
             >
               <RotateCcw className="w-3.5 h-3.5" />
               Retry Failed Chunks
@@ -173,6 +204,15 @@ export function ProcessingView({
           )}
         </div>
       </div>
+
+      {isActive && (
+        <div className="p-3.5 rounded-xl bg-indigo-950/35 border border-indigo-500/25 text-xs text-slate-200 flex items-center justify-between gap-3">
+          <span>
+            Background processing active on the server. Completed chunks are saved continuously—you
+            can safely refresh or close this browser tab and return anytime.
+          </span>
+        </div>
+      )}
 
       {movie.demoMode && (
         <div className="p-4 rounded-xl bg-amber-950/40 border border-amber-500/30 text-xs text-amber-200 leading-relaxed">
@@ -295,22 +335,44 @@ export function ProcessingView({
         <div className="lg:col-span-6 space-y-6">
           {/* Chunk Matrix */}
           <div className="rounded-xl bg-[#0F1429] border border-white/10 p-6 space-y-4">
-            <div className="flex items-center justify-between">
+            <div className="flex flex-wrap items-center justify-between gap-2">
               <h2 className="text-base font-semibold text-white">Audio Chunk Segments</h2>
               <span className="text-xs text-slate-400 tabular-nums">
                 {movie.chunkStates.length} total segment(s)
               </span>
             </div>
 
+            {movie.chunkStates.length > 0 && (
+              <div className="grid grid-cols-4 gap-2 text-center text-xs tabular-nums">
+                <div className="rounded-lg bg-[#080B18] border border-white/10 py-2 px-2">
+                  <span className="block text-[11px] text-slate-400">Pending</span>
+                  <span className="font-mono text-slate-200">{pendingCount}</span>
+                </div>
+                <div className="rounded-lg bg-[#080B18] border border-violet-500/25 py-2 px-2">
+                  <span className="block text-[11px] text-violet-300">Processing</span>
+                  <span className="font-mono text-violet-200">{processingCount}</span>
+                </div>
+                <div className="rounded-lg bg-[#080B18] border border-emerald-500/25 py-2 px-2">
+                  <span className="block text-[11px] text-emerald-300">Completed</span>
+                  <span className="font-mono text-emerald-200">{completedCount}</span>
+                </div>
+                <div className="rounded-lg bg-[#080B18] border border-rose-500/25 py-2 px-2">
+                  <span className="block text-[11px] text-rose-300">Failed</span>
+                  <span className="font-mono text-rose-200">{failedCount}</span>
+                </div>
+              </div>
+            )}
+
             {movie.chunkStates.length === 0 ? (
               <p className="text-xs text-slate-400">
                 Chunk breakdown appears once audio extraction and segmentation begin.
               </p>
             ) : (
-              <div className="grid grid-cols-2 sm:grid-cols-3 gap-2.5 max-h-60 overflow-y-auto pr-1">
+              <div className="grid grid-cols-2 sm:grid-cols-3 gap-2.5 max-h-72 overflow-y-auto pr-1">
                 {movie.chunkStates.map((chunk) => (
                   <div
                     key={chunk.index}
+                    title={chunk.error || undefined}
                     className={`px-3 py-2 rounded-lg border text-xs tabular-nums ${
                       chunk.status === 'completed'
                         ? 'bg-emerald-950/30 border-emerald-500/25 text-emerald-200'
@@ -325,9 +387,17 @@ export function ProcessingView({
                       <span>Chunk {chunk.index + 1}</span>
                       <span className="capitalize">{chunk.status}</span>
                     </div>
-                    <div className="text-[11px] opacity-80 mt-0.5 font-mono">
-                      {Math.floor(chunk.startSec)}s–{Math.floor(chunk.endSec)}s
+                    <div className="flex items-center justify-between text-[11px] opacity-80 mt-0.5 font-mono">
+                      <span>
+                        {Math.floor(chunk.startSec)}s–{Math.floor(chunk.endSec)}s
+                      </span>
+                      {chunk.attempts > 0 && <span>try {chunk.attempts}/5</span>}
                     </div>
+                    {chunk.status === 'failed' && chunk.error && (
+                      <p className="mt-1 text-[10px] text-rose-200/90 line-clamp-2 leading-snug">
+                        {chunk.error}
+                      </p>
+                    )}
                   </div>
                 ))}
               </div>

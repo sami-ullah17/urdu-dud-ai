@@ -158,12 +158,39 @@ export async function extractBackgroundBed(
   ]);
 }
 
+export async function extractSingleChunkAudio(
+  sourceAudioPath: string,
+  startSec: number,
+  endSec: number,
+  outMp3Path: string
+): Promise<void> {
+  fs.mkdirSync(path.dirname(outMp3Path), { recursive: true });
+  const clipDuration = Math.max(0.5, endSec - startSec);
+  await runProcess('ffmpeg', [
+    '-y',
+    '-ss',
+    startSec.toFixed(3),
+    '-t',
+    clipDuration.toFixed(3),
+    '-i',
+    sourceAudioPath,
+    '-ac',
+    '1',
+    '-ar',
+    '16000',
+    '-b:a',
+    '48k',
+    outMp3Path,
+  ]);
+}
+
 export async function splitAudioIntoChunks(
   sourceAudioPath: string,
   chunksDir: string,
   totalDurationSec: number,
-  chunkSeconds = 120,
-  overlapSeconds = 4
+  chunkSeconds = 90,
+  overlapSeconds = 6,
+  reuseExisting = false
 ): Promise<ExtractedChunk[]> {
   fs.mkdirSync(chunksDir, { recursive: true });
   const chunks: ExtractedChunk[] = [];
@@ -173,25 +200,13 @@ export async function splitAudioIntoChunks(
   while (cursor < totalDurationSec) {
     const startSec = Math.max(0, cursor - (index > 0 ? overlapSeconds : 0));
     const nominalEnd = Math.min(totalDurationSec, cursor + chunkSeconds);
-    const clipDuration = Math.max(0.5, nominalEnd - startSec);
     const outMp3 = path.join(chunksDir, `chunk_${String(index).padStart(4, '0')}.mp3`);
 
-    await runProcess('ffmpeg', [
-      '-y',
-      '-ss',
-      startSec.toFixed(3),
-      '-t',
-      clipDuration.toFixed(3),
-      '-i',
-      sourceAudioPath,
-      '-ac',
-      '1',
-      '-ar',
-      '16000',
-      '-b:a',
-      '64k',
-      outMp3,
-    ]);
+    const existsValid =
+      reuseExisting && fs.existsSync(outMp3) && fs.statSync(outMp3).size > 512;
+    if (!existsValid) {
+      await extractSingleChunkAudio(sourceAudioPath, startSec, nominalEnd, outMp3);
+    }
 
     chunks.push({
       index,
